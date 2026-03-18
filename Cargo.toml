@@ -1,0 +1,22 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"  # Stick to 2021 for maximum stability
+
+[package]
+name = "pulseplex"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pulseplex-core = { path = "crates/pulseplex-core" }
+pulseplex-midi = { path = "crates/pulseplex-midi" }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+spin_sleep = "1.3"
+spin_sleep_util = "0.1.1"
