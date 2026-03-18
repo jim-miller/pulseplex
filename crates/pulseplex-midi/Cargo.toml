@@ -1,0 +1,12 @@
+[package]
+name = "pulseplex-midi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+crossbeam-channel = { workspace = true }
+pulseplex-core = { workspace = true }
+tracing = { workspace = true }
+midir = "0.10.3"

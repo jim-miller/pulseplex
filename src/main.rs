@@ -4,8 +4,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clap::Parser;
 use pulseplex_core::{ArtNetBridge, DecayEnvelope};
+use pulseplex_midi::{setup_midi, MidiSignal};
+
+use clap::Parser;
+use crossbeam_channel::TryRecvError;
 use spin_sleep::SpinSleeper;
 use tracing::{debug, info, trace, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -29,26 +32,20 @@ fn main() -> anyhow::Result<()> {
 
     info!("Starting PulsePlex daemon");
 
-    let target_hz = 40.0;
-    let target_interval = Duration::from_secs_f64(0.5 / target_hz); // 25ms
+    let target_hz = 40.0; // 25ms
+    let target_interval = Duration::from_secs_f64(1.0 / target_hz);
 
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     socket.set_broadcast(true)?;
-
     let target_addr = "255.255.255.255:6454";
-
     let mut artnet = ArtNetBridge::new(0); // Universe 0
-
-    // Greater loop accuracy needed
     let sleeper = SpinSleeper::default();
+    let mut active_lights: HashMap<u8, DecayEnvelope> = HashMap::new();
+
+    let midi_input = setup_midi()?;
 
     let mut last_tick = Instant::now();
     let mut next_deadline = last_tick + target_interval;
-
-    let mut active_lights: HashMap<u8, DecayEnvelope> = HashMap::new();
-
-    // Mock timber to artificially trigger a note so we can watch it decay
-    let mut mock_trigger_time = Instant::now();
 
     loop {
         // calculate our time since last tick
@@ -56,15 +53,25 @@ fn main() -> anyhow::Result<()> {
         let delta_time = now.duration_since(last_tick);
         last_tick = now;
 
-        // mock some MIDI input
-        if mock_trigger_time.elapsed() > Duration::from_secs(2) {
-            debug!("Mock MIDI NoteOn: 36 (Kick Drum)");
-            let mut env = DecayEnvelope::new(1.0);
-            env.trigger(127);
-            active_lights.insert(36, env);
-            mock_trigger_time = Instant::now();
+        // drain the  MIDI queue
+        loop {
+            match midi_input.rx.try_recv() {
+                Ok(MidiSignal::NoteOn { note, velocity }) => {
+                    debug!("Received: Note: {} Velocity: {}", note, velocity);
+                    let mut env = DecayEnvelope::new(0.3);
+                    env.trigger(velocity);
+                    active_lights.insert(note, env);
+                }
+                Ok(MidiSignal::NoteOff { note }) => {
+                    trace!("NoteOff: {}", note);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    warn!("MIDI hardware disconnected!");
+                    break;
+                }
+            }
         }
-
         // update decay envelopes
         active_lights.retain(|note, env| {
             env.tick(delta_time);
