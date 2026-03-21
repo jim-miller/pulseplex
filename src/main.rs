@@ -1,6 +1,8 @@
+mod config;
+
 use std::{
     collections::HashMap,
-    net::UdpSocket,
+    net::{ToSocketAddrs, UdpSocket},
     time::{Duration, Instant},
 };
 
@@ -12,6 +14,8 @@ use crossbeam_channel::TryRecvError;
 use spin_sleep::SpinSleeper;
 use tracing::{debug, info, trace, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+use crate::config::{MappingConfig, PulsePlexConfig};
 
 #[derive(Parser)]
 struct Args {
@@ -30,19 +34,38 @@ fn main() -> anyhow::Result<()> {
         .with(fmt::layer().with_target(true))
         .init();
 
-    info!("Starting PulsePlex daemon");
+    let config = PulsePlexConfig::load("pulseplex.toml")?;
+    info!(
+        "Loaded configuration for MIDI device: {}",
+        config.midi.device_name
+    );
+
+    let note_mappings: HashMap<u8, MappingConfig> =
+        config.mapping.into_iter().map(|m| (m.note, m)).collect();
 
     let target_hz = 40.0; // 25ms
     let target_interval = Duration::from_secs_f64(1.0 / target_hz);
 
+    info!("Starting PulsePlex daemon");
+
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     socket.set_broadcast(true)?;
-    let target_addr = "255.255.255.255:6454";
-    let mut artnet = ArtNetBridge::new(0); // Universe 0
+
+    let target_addr = config
+        .artnet
+        .target_ip
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Could not parse target_ip address"))?;
+
+    info!("Network initialized. Target: {}", target_addr);
+
+    let mut artnet = ArtNetBridge::new(config.artnet.universe);
+
     let sleeper = SpinSleeper::default();
     let mut active_lights: HashMap<u8, DecayEnvelope> = HashMap::new();
 
-    let midi_input = setup_midi()?;
+    let midi_input = setup_midi(&config.midi.device_name)?;
 
     let mut last_tick = Instant::now();
     let mut next_deadline = last_tick + target_interval;
@@ -53,14 +76,18 @@ fn main() -> anyhow::Result<()> {
         let delta_time = now.duration_since(last_tick);
         last_tick = now;
 
-        // drain the  MIDI queue
+        // drain the MIDI queue
         loop {
             match midi_input.rx.try_recv() {
                 Ok(MidiSignal::NoteOn { note, velocity }) => {
-                    debug!("Received: Note: {} Velocity: {}", note, velocity);
-                    let mut env = DecayEnvelope::new(0.3);
-                    env.trigger(velocity);
-                    active_lights.insert(note, env);
+                    if let Some(mapping) = note_mappings.get(&note) {
+                        debug!("Received: Note: {} Velocity: {}", note, velocity);
+                        let mut env = DecayEnvelope::new(mapping.decay_seconds);
+                        env.trigger(velocity);
+                        active_lights.insert(note, env);
+                    } else {
+                        trace!("Ignored unmapped note: {}", note);
+                    }
                 }
                 Ok(MidiSignal::NoteOff { note }) => {
                     trace!("NoteOff: {}", note);
@@ -90,9 +117,9 @@ fn main() -> anyhow::Result<()> {
         artnet.clear_data();
         for (note, env) in &active_lights {
             // simple mapping: Note 36 (Kick Drum, C1) -> DMX Ch0
-            // TODO: change to config-based
-            let channel = (*note as usize).saturating_sub(36);
-            artnet.set_channel(channel, env.dmx_value());
+            if let Some(mapping) = note_mappings.get(note) {
+                artnet.set_channel(mapping.dmx_channel, env.dmx_value());
+            }
         }
 
         // send out to DMX
@@ -106,7 +133,7 @@ fn main() -> anyhow::Result<()> {
         } else {
             // Missed our deadline and overslept
             warn!(
-                "Frame drop detected! Work too longer than {:?}",
+                "Frame drop detected! Work took longer than {:?}",
                 target_interval
             );
         }

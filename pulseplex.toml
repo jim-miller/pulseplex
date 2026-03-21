@@ -1,0 +1,17 @@
+[midi]
+# Partial match for now
+device_name = "Impact GXP49"
+
+[artnet]
+target_ip = "255.255.255.255:6454"
+universe = 0
+
+[[mapping]]
+note = 36           # Kick
+dmx_channel = 0
+decay_seconds = 0.5
+
+[[mapping]]
+note = 38           # Snare
+dmx_channel = 4
+decay_seconds = 0.2

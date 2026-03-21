@@ -1,7 +1,7 @@
-use anyhow::{anyhow, bail, Ok, Result};
+use anyhow::{anyhow, bail};
 use crossbeam_channel::{unbounded, Receiver};
 use midir::{MidiInput, MidiInputConnection};
-use tracing::info;
+use tracing::{info, trace};
 
 pub enum MidiSignal {
     NoteOn { note: u8, velocity: u8 },
@@ -14,7 +14,7 @@ pub struct MidiReceiver {
     _conn: MidiInputConnection<()>,
 }
 
-pub fn setup_midi() -> Result<MidiReceiver> {
+pub fn setup_midi(target_device: &str) -> anyhow::Result<MidiReceiver> {
     let mut midi_in = MidiInput::new("pulseplex-input")?;
     midi_in.ignore(midir::Ignore::None);
 
@@ -25,13 +25,33 @@ pub fn setup_midi() -> Result<MidiReceiver> {
         bail!("No physical MIDI ports found. Please connect your module.")
     }
 
-    let port = &ports[1];
-    let port_name = midi_in.port_name(port)?;
+    // Search for preferred device
+    let mut selected_port = None;
+    trace!("Looking for MIDI device: {}", target_device);
+    for p in ports.iter() {
+        if let Ok(name) = midi_in.port_name(p) {
+            trace!("Found: {}", name);
+            if name.contains(target_device) {
+                trace!("Success!");
+                selected_port = Some(p.clone());
+                break;
+            }
+        }
+    }
+
+    let port = selected_port.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Could not find MIDI device containing string: '{}'",
+            target_device
+        )
+    })?;
+
+    let port_name = midi_in.port_name(&port)?;
     info!("Binding to MIDI port: {}", port_name);
 
     let conn = midi_in
         .connect(
-            port,
+            &port,
             "pulsepluex-read",
             move |_stamp, message, _| {
                 if message.len() >= 3 {
@@ -54,5 +74,6 @@ pub fn setup_midi() -> Result<MidiReceiver> {
         )
         .map_err(|e| anyhow!("Failed to connect to MIDI port: {}", e))?;
 
+    trace!("MIDI successfully initialized...");
     Ok(MidiReceiver { rx, _conn: conn })
 }
