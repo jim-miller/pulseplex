@@ -17,21 +17,29 @@ target_ip = "255.255.255.255:6454"
 universe = 0
 
 [[mapping]]
-note = 36           # Kick
+note = 36                     # Kick
 dmx_channel = 0
 decay_seconds = 0.5
+velocity_curve = "hard"
+decay_profile = "exponential"
 
 [[mapping]]
-note = 38           # Snare
+note = 38                # Snare
 dmx_channel = 4
 decay_seconds = 0.2
+velocity_curve = "soft"
+decay_profile = "linear"
 
 [[mapping]]
-note = 42           # Closed Hi-Hat
+note = 42                # Closed Hi-Hat
 dmx_channel = 7
 decay_seconds = 0.2
+velocity_curve = "soft"
+decay_profile = "linear"
 
 [[mapping]]
-note = 44           # Crash Cymbal
+note = 44                # Crash Cymbal
 dmx_channel = 10
 decay_seconds = 1.0
+velocity_curve = "hard"
+decay_profile = "linear"

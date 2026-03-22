@@ -157,7 +157,12 @@ fn main() -> anyhow::Result<()> {
                 Ok(MidiSignal::NoteOn { note, velocity }) => {
                     if let Some(mapping) = note_mappings.get(&note) {
                         debug!("Received: Note: {} Velocity: {}", note, velocity);
-                        let mut env = DecayEnvelope::new(mapping.decay_seconds);
+
+                        let mut env = DecayEnvelope::new(
+                            mapping.decay_seconds,
+                            mapping.velocity_curve,
+                            mapping.decay_profile,
+                        );
                         env.trigger(velocity);
                         active_lights.insert(note, env);
                     } else {
