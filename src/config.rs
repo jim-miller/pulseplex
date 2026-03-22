@@ -1,12 +1,13 @@
 use anyhow::{Ok, Result};
 use serde::Deserialize;
-use std::fs;
+use std::{collections::HashMap, fs};
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct PulsePlexConfig {
     pub midi: MidiConfig,
     pub artnet: ArtNetConfig,
     pub mapping: Vec<MappingConfig>,
+    pub shutdown: ShutdownConfig,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -25,6 +26,19 @@ pub struct MappingConfig {
     pub note: u8,
     pub dmx_channel: usize,
     pub decay_seconds: f32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub enum ShutdownMode {
+    Blackout,
+    Default,
+    Restore,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ShutdownConfig {
+    pub mode: ShutdownMode,
+    pub defaults: Option<HashMap<usize, u8>>,
 }
 
 impl PulsePlexConfig {

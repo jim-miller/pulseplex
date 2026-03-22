@@ -95,6 +95,12 @@ impl ArtNetBridge {
     pub fn increment_sequence(&mut self) {
         self.buffer[12] = self.buffer[12].wrapping_add(1);
     }
+
+    pub fn set_raw_data(&mut self, initial_state: &[u8; 512]) {
+        (0..initial_state.len()).for_each(|i| {
+            self.set_channel(i, initial_state[i]);
+        });
+    }
 }
 
 #[cfg(test)]
