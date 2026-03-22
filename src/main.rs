@@ -11,6 +11,7 @@ use pulseplex_midi::{setup_midi, MidiSignal};
 
 use clap::Parser;
 use crossbeam_channel::TryRecvError;
+use notify::Watcher;
 use spin_sleep::SpinSleeper;
 use tracing::{debug, info, trace, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -34,13 +35,33 @@ fn main() -> anyhow::Result<()> {
         .with(fmt::layer().with_target(true))
         .init();
 
-    let config = PulsePlexConfig::load("pulseplex.toml")?;
+    const CONFIG_FILE: &str = "pulseplex.toml";
+
+    let config = PulsePlexConfig::load(CONFIG_FILE)?;
     info!(
         "Loaded configuration for MIDI device: {}",
         config.midi.device_name
     );
 
-    let note_mappings: HashMap<u8, MappingConfig> = config
+    let (config_tx, config_rx) = crossbeam_channel::unbounded();
+
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res {
+            // Send a reload ping for any modified path that ends with our config
+            if event.paths.iter().any(|p| p.ends_with(CONFIG_FILE)) {
+                let _ = config_tx.send(());
+            }
+        }
+    })?;
+
+    // Watch current dir
+    watcher.watch(
+        std::path::Path::new("."),
+        notify::RecursiveMode::NonRecursive,
+    )?;
+    info!("Hot-reloading enabled for {CONFIG_FILE}");
+
+    let mut note_mappings: HashMap<u8, MappingConfig> = config
         .clone()
         .mapping
         .into_iter()
@@ -104,6 +125,31 @@ fn main() -> anyhow::Result<()> {
         let now = Instant::now();
         let delta_time = now.duration_since(last_tick);
         last_tick = now;
+
+        let mut needs_reload = false;
+        while config_rx.try_recv().is_ok() {
+            needs_reload = true;
+        }
+
+        if needs_reload {
+            info!(
+                "config change detected in {}, attempting reload...",
+                CONFIG_FILE
+            );
+            match PulsePlexConfig::load(CONFIG_FILE) {
+                Ok(new_config) => {
+                    // Swap mappings
+                    note_mappings = new_config
+                        .mapping
+                        .into_iter()
+                        .map(|m| (m.note, m))
+                        .collect();
+                }
+                Err(e) => {
+                    warn!("Failed to reload config (keeping previous state): {}", e);
+                }
+            }
+        }
 
         // drain the MIDI queue
         loop {

@@ -25,3 +25,13 @@ decay_seconds = 0.5
 note = 38           # Snare
 dmx_channel = 4
 decay_seconds = 0.2
+
+[[mapping]]
+note = 42           # Closed Hi-Hat
+dmx_channel = 7
+decay_seconds = 0.2
+
+[[mapping]]
+note = 44           # Crash Cymbal
+dmx_channel = 10
+decay_seconds = 1.0
