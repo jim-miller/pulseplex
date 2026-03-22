@@ -1,30 +1,73 @@
 use std::time::Duration;
 
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VelocityCurve {
+    #[default]
+    Linear,
+    Hard,
+    Soft,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DecayProfile {
+    #[default]
+    Linear,
+    Exponential,
+}
 pub struct DecayEnvelope {
     pub intensity: f32,        // 0.0 to 1.0
     pub decay_per_second: f32, // e.g., 0.90
+    pub velocity_curve: VelocityCurve,
+    pub decay_profile: DecayProfile,
 }
 
 impl DecayEnvelope {
-    pub fn new(decay_seconds: f32) -> Self {
+    pub fn new(
+        decay_seconds: f32,
+        velocity_curve: VelocityCurve,
+        decay_profile: DecayProfile,
+    ) -> Self {
         Self {
             intensity: 0.0,
             decay_per_second: 1.0 / decay_seconds.max(0.001),
+            velocity_curve,
+            decay_profile,
         }
     }
 
     /// Trigger the envelope with a MIDI velocity (0-127)
     pub fn trigger(&mut self, velocity: u8) {
+        let normalized = velocity as f32 / 127.0;
         // Map 0..127 to 0.0..1.0
-        self.intensity = velocity as f32 / 127.0;
+        self.intensity = match self.velocity_curve {
+            VelocityCurve::Linear => normalized,
+            VelocityCurve::Hard => normalized.powi(2),
+            VelocityCurve::Soft => normalized.sqrt(),
+        };
     }
 
     /// Progress the decay by one tick
     pub fn tick(&mut self, dt: Duration) {
         let dt_seconds = dt.as_secs_f32();
-        let reduction = self.decay_per_second * dt_seconds;
+        match self.decay_profile {
+            DecayProfile::Linear => {
+                let reduction = self.decay_per_second * dt_seconds;
+                self.intensity = (self.intensity - reduction).max(0.0);
+            }
+            DecayProfile::Exponential => {
+                let decay_rate = 5.0 * self.decay_per_second;
+                self.intensity *= (-decay_rate * dt_seconds).exp();
 
-        self.intensity = (self.intensity - reduction).max(0.0);
+                // Snap to 0 at the bottom to avoid long tail
+                if self.intensity < 0.01 {
+                    self.intensity = 0.0;
+                }
+            }
+        }
     }
 
     pub fn is_dead(&self) -> bool {
@@ -107,11 +150,11 @@ impl ArtNetBridge {
 mod test {
     use std::time::Duration;
 
-    use crate::DecayEnvelope;
+    use crate::{DecayEnvelope, DecayProfile, VelocityCurve};
 
     #[test]
     fn test_time_aware_decay() {
-        let mut envelope = DecayEnvelope::new(1.0);
+        let mut envelope = DecayEnvelope::new(1.0, VelocityCurve::Soft, DecayProfile::Linear);
         envelope.trigger(127);
 
         // After 1/2 second, intensity should be roughly half

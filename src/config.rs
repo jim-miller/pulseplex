@@ -1,4 +1,5 @@
 use anyhow::{Ok, Result};
+use pulseplex_core::{DecayProfile, VelocityCurve};
 use serde::Deserialize;
 use std::{collections::HashMap, fs};
 
@@ -26,6 +27,10 @@ pub struct MappingConfig {
     pub note: u8,
     pub dmx_channel: usize,
     pub decay_seconds: f32,
+    #[serde(default)]
+    pub velocity_curve: VelocityCurve,
+    #[serde(default)]
+    pub decay_profile: DecayProfile,
 }
 
 #[derive(Clone, Debug, Deserialize)]
