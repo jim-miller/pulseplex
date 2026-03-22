@@ -25,6 +25,7 @@ spin_sleep_util = "0.1.1"
 toml = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 ctrlc = "3.5.2"
+notify = "8.2.0"
 
 [workspace.dependencies]
 pulseplex-core = { path = "crates/pulseplex-core" }
