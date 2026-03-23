@@ -31,6 +31,7 @@ pub struct MappingConfig {
     pub velocity_curve: VelocityCurve,
     #[serde(default)]
     pub decay_profile: DecayProfile,
+    pub color: Option<[u8; 3]>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

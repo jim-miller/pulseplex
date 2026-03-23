@@ -198,7 +198,13 @@ fn main() -> anyhow::Result<()> {
         for (note, env) in &active_lights {
             // simple mapping: Note 36 (Kick Drum, C1) -> DMX Ch0
             if let Some(mapping) = note_mappings.get(note) {
-                artnet.set_channel(mapping.dmx_channel, env.dmx_value());
+                if let Some([r, g, b]) = mapping.color {
+                    artnet.set_channel(mapping.dmx_channel, (r as f32 * env.intensity) as u8);
+                    artnet.set_channel(mapping.dmx_channel + 1, (g as f32 * env.intensity) as u8);
+                    artnet.set_channel(mapping.dmx_channel + 2, (b as f32 * env.intensity) as u8);
+                } else {
+                    artnet.set_channel(mapping.dmx_channel, env.dmx_value());
+                }
             }
         }
 

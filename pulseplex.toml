@@ -22,13 +22,15 @@ dmx_channel = 0
 decay_seconds = 0.5
 velocity_curve = "hard"
 decay_profile = "exponential"
+color = [255, 0, 0]
 
 [[mapping]]
 note = 38                # Snare
-dmx_channel = 4
+dmx_channel = 3
 decay_seconds = 0.2
 velocity_curve = "soft"
 decay_profile = "linear"
+color = [255, 255, 0]
 
 [[mapping]]
 note = 42                # Closed Hi-Hat
@@ -40,6 +42,6 @@ decay_profile = "linear"
 [[mapping]]
 note = 44                # Crash Cymbal
 dmx_channel = 10
-decay_seconds = 1.0
+decay_seconds = 2.0
 velocity_curve = "hard"
 decay_profile = "linear"
