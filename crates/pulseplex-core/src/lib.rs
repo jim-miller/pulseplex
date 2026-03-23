@@ -147,10 +147,10 @@ impl ArtNetBridge {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use std::time::Duration;
 
-    use crate::{DecayEnvelope, DecayProfile, VelocityCurve};
+    use crate::{ArtNetBridge, DecayEnvelope, DecayProfile, VelocityCurve};
 
     #[test]
     fn test_time_aware_decay() {
@@ -161,5 +161,104 @@ mod test {
         envelope.tick(Duration::from_millis(500));
         assert!((envelope.intensity - 0.5).abs() < 0.01);
         assert_eq!(envelope.dmx_value(), 127);
+    }
+
+    #[test]
+    fn test_velocity_curves() {
+        let mut env_hard = DecayEnvelope::new(1.0, VelocityCurve::Hard, DecayProfile::Linear);
+        let mut env_soft = DecayEnvelope::new(1.0, VelocityCurve::Soft, DecayProfile::Linear);
+
+        // MIDI velocity 64 is roughly 0.5 normalized
+        env_hard.trigger(64);
+        env_soft.trigger(64);
+
+        // Hard curve: 0.5^2 = 0.25
+        assert!((env_hard.intensity - 0.25).abs() < 0.01);
+
+        // Soft curve: sqrt(0.5) ≈ 0.707
+        assert!((env_soft.intensity - 0.707).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_decay_profiles() {
+        let mut env_lin = DecayEnvelope::new(1.0, VelocityCurve::Linear, DecayProfile::Linear);
+        let mut env_exp = DecayEnvelope::new(1.0, VelocityCurve::Linear, DecayProfile::Exponential);
+
+        env_lin.trigger(127); // Intensity 1.0
+        env_exp.trigger(127); // Intensity 1.0
+
+        // Tick forward 0.5 seconds
+        let dt = Duration::from_millis(500);
+        env_lin.tick(dt);
+        env_exp.tick(dt);
+
+        // Linear: should be exactly 0.5
+        assert_eq!(env_lin.intensity, 0.5);
+
+        // Exponential: should be e^(-5 * 0.5) = e^-2.5 ≈ 0.082
+        assert!((env_exp.intensity - 0.082).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_envelope_death() {
+        let mut env = DecayEnvelope::new(0.1, VelocityCurve::Linear, DecayProfile::Linear);
+        env.trigger(127);
+
+        // Tick past the decay time
+        env.tick(Duration::from_millis(150));
+
+        assert!(env.is_dead());
+        assert_eq!(env.dmx_value(), 0);
+    }
+
+    #[test]
+    fn test_artnet_protocol_header() {
+        let bridge = ArtNetBridge::new(0);
+        let bytes = bridge.as_bytes();
+
+        // Art-Net header must be "Art-Net\0"
+        assert_eq!(&bytes[0..8], b"Art-Net\0");
+
+        // OpCode should be 0x5000 (Stored as 0x00, 0x50 in little-endian)
+        assert_eq!(bytes[8], 0x00);
+        assert_eq!(bytes[9], 0x50);
+
+        // Protocol version should be 14
+        assert_eq!(bytes[11], 14);
+    }
+
+    #[test]
+    fn test_artnet_channel_mapping() {
+        let mut bridge = ArtNetBridge::new(0);
+
+        // Set channel 0 and channel 511 (the boundaries)
+        bridge.set_channel(0, 255);
+        bridge.set_channel(511, 128);
+
+        let bytes = bridge.as_bytes();
+        assert_eq!(bytes[18], 255); // Data starts at index 18
+        assert_eq!(bytes[18 + 511], 128);
+    }
+
+    #[test]
+    fn test_sequence_increment() {
+        let mut bridge = ArtNetBridge::new(0);
+        let initial_seq = bridge.as_bytes()[12];
+
+        bridge.increment_sequence();
+        assert_eq!(bridge.as_bytes()[12], initial_seq.wrapping_add(1));
+    }
+
+    #[test]
+    fn test_hit_to_dmx_sequence() {
+        let mut env = DecayEnvelope::new(0.2, VelocityCurve::Linear, DecayProfile::Linear);
+
+        // Hit it hard
+        env.trigger(127);
+        assert_eq!(env.dmx_value(), 255);
+
+        // Halfway through decay (0.1s of 0.2s)
+        env.tick(Duration::from_millis(100));
+        assert_eq!(env.dmx_value(), 127); // 50% of 255
     }
 }
