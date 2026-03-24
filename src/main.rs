@@ -2,6 +2,8 @@ mod config;
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,7 +11,7 @@ use std::time::{Duration, Instant};
 use pulseplex_core::{ArtNetBridge, DecayEnvelope};
 use pulseplex_midi::{setup_midi, MidiSignal};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossbeam_channel::TryRecvError;
 use notify::Watcher;
 use spin_sleep::SpinSleeper;
@@ -19,25 +21,65 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use crate::config::{MappingConfig, PulsePlexConfig, ShutdownMode};
 
 #[derive(Parser)]
+#[command(
+    name = "pulseplex",
+    version,
+    about = "MIDI to Art-Net bridge for drummers"
+)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// Enable verbose logging
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     verbose: bool,
 }
 
+#[derive(Subcommand)]
+enum Commands {
+    /// Start the PulsePlex daemon (default)
+    Run {
+        /// Path to configuration file
+        #[arg(short, long, default_value = "pulseplex.toml")]
+        config: String,
+    },
+    /// Validate the configuration file and check for DMX collisions
+    Check {
+        /// Path to configuration file
+        #[arg(short, long, default_value = "pulseplex.toml")]
+        config: String,
+    },
+}
+
 fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let cli = Args::parse();
+
+    // Setup logging (verbose flag is global)
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(if args.verbose { "trace" } else { "info" }));
+        .unwrap_or_else(|_| EnvFilter::new(if cli.verbose { "trace" } else { "info" }));
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().with_target(true))
+        .with(fmt::layer())
         .init();
 
-    const CONFIG_FILE: &str = "pulseplex.toml";
+    match cli.command.unwrap_or(Commands::Run {
+        config: "pulseplex.toml".to_string(),
+    }) {
+        Commands::Check { config } => {
+            handle_check(&config)?;
+        }
+        Commands::Run { config } => {
+            run_daemon(config)?;
+        }
+    }
 
-    let config = PulsePlexConfig::load(CONFIG_FILE)?;
+    Ok(())
+}
+
+fn run_daemon(config_path: String) -> anyhow::Result<()> {
+    let path_to_watch = PathBuf::from(&config_path);
+    let config = PulsePlexConfig::load(&config_path)?;
     info!(
         "Loaded configuration for MIDI device: {}",
         config.midi.device_name
@@ -45,10 +87,12 @@ fn main() -> anyhow::Result<()> {
 
     let (config_tx, config_rx) = crossbeam_channel::unbounded();
 
+    let closure_path = path_to_watch.clone();
+
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
             // Send a reload ping for any modified path that ends with our config
-            if event.paths.iter().any(|p| p.ends_with(CONFIG_FILE)) {
+            if event.paths.iter().any(|p| p.ends_with(&closure_path)) {
                 let _ = config_tx.send(());
             }
         }
@@ -59,7 +103,7 @@ fn main() -> anyhow::Result<()> {
         std::path::Path::new("."),
         notify::RecursiveMode::NonRecursive,
     )?;
-    info!("Hot-reloading enabled for {CONFIG_FILE}");
+    info!("Hot-reloading enabled for {config_path}");
 
     let mut note_mappings: HashMap<u8, MappingConfig> = config
         .clone()
@@ -134,9 +178,9 @@ fn main() -> anyhow::Result<()> {
         if needs_reload {
             info!(
                 "config change detected in {}, attempting reload...",
-                CONFIG_FILE
+                config_path
             );
-            match PulsePlexConfig::load(CONFIG_FILE) {
+            match PulsePlexConfig::load(&config_path) {
                 Ok(new_config) => {
                     // Swap mappings
                     note_mappings = new_config
@@ -266,5 +310,63 @@ fn perform_shutdown(
 
     // Send the final "Exit Frame"
     socket.send_to(artnet.as_bytes(), addr)?;
+    Ok(())
+}
+
+fn handle_check(path: &str) -> anyhow::Result<()> {
+    info!("Checking configuration: {}", path);
+
+    // 1. Test TOML Parsing
+    let config = PulsePlexConfig::load(path)?;
+    println!("✅ TOML Structure: Valid");
+
+    // 2. Test Network String
+    match SocketAddr::from_str(&config.artnet.target_ip) {
+        Ok(_) => println!("✅ Network: Target IP/Port format is valid"),
+        Err(_) => {
+            // If SocketAddr fails, check if it's because it's a hostname
+            // (Only if you want to support hostnames but warn about shorthand)
+            if config.artnet.target_ip.to_socket_addrs().is_ok() {
+                println!(
+                    "⚠️  Network: '{}' is a valid hostname/shorthand, but not a literal IP",
+                    config.artnet.target_ip
+                );
+            } else {
+                anyhow::bail!(
+                    "❌ Network: Invalid target_ip format '{}'",
+                    config.artnet.target_ip
+                );
+            }
+        }
+    }
+
+    // 3. Test DMX Bounds and Overlaps
+    let mut used_channels = std::collections::HashMap::new();
+    for mapping in &config.mapping {
+        // Assume RGB takes 3 channels, Dimmer takes 1
+        let span = if mapping.color.is_some() { 3 } else { 1 };
+
+        for offset in 0..span {
+            let channel = mapping.dmx_channel + offset;
+
+            if channel > 511 {
+                anyhow::bail!(
+                    "❌ DMX: Note {} (channel {}) exceeds universe limit (511)",
+                    mapping.note,
+                    channel
+                );
+            }
+
+            if let Some(other_note) = used_channels.insert(channel, mapping.note) {
+                warn!(
+                    "DMX Collision: Channel {} is used by both Note {} and Note {}",
+                    channel, other_note, mapping.note
+                );
+            }
+        }
+    }
+
+    println!("✅ DMX Mappings: All notes within 0-511 range");
+    info!("Configuration check passed.");
     Ok(())
 }

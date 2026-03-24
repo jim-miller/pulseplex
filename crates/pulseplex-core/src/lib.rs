@@ -148,9 +148,8 @@ impl ArtNetBridge {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::time::Duration;
-
-    use crate::{ArtNetBridge, DecayEnvelope, DecayProfile, VelocityCurve};
 
     #[test]
     fn test_time_aware_decay() {
@@ -260,5 +259,94 @@ mod tests {
         // Halfway through decay (0.1s of 0.2s)
         env.tick(Duration::from_millis(100));
         assert_eq!(env.dmx_value(), 127); // 50% of 255
+    }
+
+    #[test]
+    fn test_velocity_curve_accuracy() {
+        let mut env_linear = DecayEnvelope::new(1.0, VelocityCurve::Linear, DecayProfile::Linear);
+        let mut env_hard = DecayEnvelope::new(1.0, VelocityCurve::Hard, DecayProfile::Linear);
+        let mut env_soft = DecayEnvelope::new(1.0, VelocityCurve::Soft, DecayProfile::Linear);
+
+        // Mid point
+        let mid_velocity = 64;
+        let normalized = mid_velocity as f32 / 127.0; // ~0.5039
+
+        env_linear.trigger(mid_velocity);
+        env_soft.trigger(mid_velocity);
+        env_hard.trigger(mid_velocity);
+
+        // Linear 1:1
+        assert!((env_linear.intensity - normalized).abs() < 0.001);
+        // Hard: x^2
+        assert!((env_hard.intensity - normalized.powi(2)).abs() < 0.001);
+        // Soft: sqrt(x) (~0.71)
+        assert!((env_soft.intensity - normalized.sqrt()).abs() < 0.001);
+    }
+    /// Test that Exponential decay provides the "long tail" feel compared to Linear.
+    #[test]
+    fn test_decay_profile_behavior() {
+        let decay_time = 1.0;
+        let mut env_lin =
+            DecayEnvelope::new(decay_time, VelocityCurve::Linear, DecayProfile::Linear);
+        let mut env_exp =
+            DecayEnvelope::new(decay_time, VelocityCurve::Linear, DecayProfile::Exponential);
+
+        env_lin.trigger(127);
+        env_exp.trigger(127);
+
+        // Move forward 0.5 seconds (halfway point)
+        let dt = Duration::from_millis(500);
+        env_lin.tick(dt);
+        env_exp.tick(dt);
+
+        // Linear should be exactly 0.5
+        assert!((env_lin.intensity - 0.5).abs() < 0.001);
+
+        // Exponential should have dropped significantly faster initially
+        // Math: e^(-5 * 0.5) = e^-2.5 ≈ 0.082
+        assert!(env_exp.intensity < 0.1);
+        assert!((env_exp.intensity - 0.082).abs() < 0.01);
+    }
+
+    /// Verify Art-Net packet structure for 8-bit DMX compliance.
+    #[test]
+    fn test_artnet_bridge_structure() {
+        let universe = 1;
+        let mut bridge = ArtNetBridge::new(universe);
+
+        // Check Header & Protocol Version
+        let bytes = bridge.as_bytes();
+        assert_eq!(&bytes[0..8], b"Art-Net\0");
+        assert_eq!(bytes[11], 14); // Protocol version
+
+        // Check Universe (Little Endian)
+        assert_eq!(bytes[14], 1);
+        assert_eq!(bytes[15], 0);
+
+        // Set a channel and check data offset (DMX data starts at index 18)
+        bridge.set_channel(0, 255);
+        bridge.set_channel(511, 42);
+
+        let data_bytes = bridge.as_bytes();
+        assert_eq!(data_bytes[18], 255);
+        assert_eq!(data_bytes[18 + 511], 42);
+    }
+
+    #[test]
+    fn test_envelope_lifecycle() {
+        let mut env = DecayEnvelope::new(0.1, VelocityCurve::Linear, DecayProfile::Linear);
+
+        // 1. Start dead
+        assert!(env.is_dead());
+
+        // 2. Trigger
+        env.trigger(127);
+        assert!(!env.is_dead());
+        assert_eq!(env.dmx_value(), 255);
+
+        // 3. Tick to completion
+        env.tick(Duration::from_millis(101));
+        assert!(env.is_dead());
+        assert_eq!(env.dmx_value(), 0);
     }
 }
