@@ -11,14 +11,19 @@ use std::time::{Duration, Instant};
 use pulseplex_core::{ArtNetBridge, DecayEnvelope};
 use pulseplex_midi::{setup_midi, MidiSignal};
 
+use anyhow::bail;
 use clap::{Parser, Subcommand};
 use crossbeam_channel::TryRecvError;
+use dialoguer::theme::ColorfulTheme;
+use dialoguer::Select;
 use notify::Watcher;
 use spin_sleep::SpinSleeper;
 use tracing::{debug, info, trace, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use crate::config::{MappingConfig, PulsePlexConfig, ShutdownMode};
+use crate::config::{
+    get_config_path, update_midi_device_in_config, MappingConfig, PulsePlexConfig, ShutdownMode,
+};
 
 #[derive(Parser)]
 #[command(
@@ -39,15 +44,19 @@ struct Args {
 enum Commands {
     /// Start the PulsePlex daemon (default)
     Run {
-        /// Path to configuration file
-        #[arg(short, long, default_value = "pulseplex.toml")]
-        config: String,
+        /// Path to configuration file (Overrides env vars)
+        #[arg(short, long)]
+        config: Option<String>,
+
+        /// Force the interactive MIDI device selection prompt
+        #[arg(short, long)]
+        select_midi: bool,
     },
     /// Validate the configuration file and check for DMX collisions
     Check {
-        /// Path to configuration file
-        #[arg(short, long, default_value = "pulseplex.toml")]
-        config: String,
+        /// Path to configuration file (Overrides env vars)
+        #[arg(short, long)]
+        config: Option<String>,
     },
 }
 
@@ -64,26 +73,72 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     match cli.command.unwrap_or(Commands::Run {
-        config: "pulseplex.toml".to_string(),
+        config: None,
+        select_midi: false,
     }) {
         Commands::Check { config } => {
-            handle_check(&config)?;
+            let path = get_config_path(config.as_ref());
+            handle_check(path.to_string_lossy().as_ref())?;
         }
-        Commands::Run { config } => {
-            run_daemon(config)?;
+        Commands::Run {
+            config,
+            select_midi,
+        } => {
+            let path = get_config_path(config.as_ref());
+            run_daemon(path, select_midi)?;
         }
     }
 
     Ok(())
 }
 
-fn run_daemon(config_path: String) -> anyhow::Result<()> {
-    let path_to_watch = PathBuf::from(&config_path);
-    let config = PulsePlexConfig::load(&config_path)?;
+fn run_daemon(config_path: PathBuf, force_select: bool) -> anyhow::Result<()> {
+    let path_to_watch = config_path.clone();
+    let config_path_str = config_path.to_string_lossy().to_string();
+
+    let mut config = PulsePlexConfig::load(&config_path_str)?;
     info!(
         "Loaded configuration for MIDI device: {}",
         config.midi.device_name
     );
+
+    let available_devices = pulseplex_midi::list_midi_devices()?;
+
+    if available_devices.is_empty() {
+        bail!("No MIDI input devices detected on the system.");
+    }
+
+    let current_device = &config.midi.device_name;
+    let device_missing = !available_devices.contains(current_device);
+
+    if device_missing || force_select {
+        if device_missing && !current_device.is_empty() {
+            warn!(
+                "Configured MIDI device '{}' is not connected.",
+                current_device
+            );
+        }
+
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select your MIDI input device")
+            .items(&available_devices)
+            .default(0)
+            .interact()?;
+
+        let chosen_device = &available_devices[selection];
+        info!("Selected MIDI device: {}", chosen_device);
+
+        // 3. Save the choice back to the TOML file
+        update_midi_device_in_config(&config_path_str, chosen_device)?;
+
+        // Update our working config state
+        config.midi.device_name = chosen_device.to_string();
+    } else {
+        info!(
+            "Loaded configuration for MIDI device: {}",
+            config.midi.device_name
+        );
+    }
 
     let (config_tx, config_rx) = crossbeam_channel::unbounded();
 
@@ -103,7 +158,7 @@ fn run_daemon(config_path: String) -> anyhow::Result<()> {
         std::path::Path::new("."),
         notify::RecursiveMode::NonRecursive,
     )?;
-    info!("Hot-reloading enabled for {config_path}");
+    info!("Hot-reloading enabled for {config_path_str}");
 
     let mut note_mappings: HashMap<u8, MappingConfig> = config
         .clone()
@@ -178,9 +233,9 @@ fn run_daemon(config_path: String) -> anyhow::Result<()> {
         if needs_reload {
             info!(
                 "config change detected in {}, attempting reload...",
-                config_path
+                config_path_str
             );
-            match PulsePlexConfig::load(&config_path) {
+            match PulsePlexConfig::load(&config_path_str) {
                 Ok(new_config) => {
                     // Swap mappings
                     note_mappings = new_config
