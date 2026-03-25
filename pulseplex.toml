@@ -9,8 +9,8 @@ mode = "Restore"
 1 = 128 # set channel 1 to 50% on exit
 
 [midi]
-# Partial match for now
-device_name = "Impact GXP49"
+# Leave device_name blank to force selection at startup
+device_name = ""
 
 [artnet]
 target_ip = "255.255.255.255:6454"

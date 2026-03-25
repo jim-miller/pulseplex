@@ -1,6 +1,7 @@
 mod config;
 
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -11,14 +12,19 @@ use std::time::{Duration, Instant};
 use pulseplex_core::{ArtNetBridge, DecayEnvelope};
 use pulseplex_midi::{setup_midi, MidiSignal};
 
+use anyhow::bail;
 use clap::{Parser, Subcommand};
 use crossbeam_channel::TryRecvError;
+use dialoguer::theme::ColorfulTheme;
+use dialoguer::Select;
 use notify::Watcher;
 use spin_sleep::SpinSleeper;
 use tracing::{debug, info, trace, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use crate::config::{MappingConfig, PulsePlexConfig, ShutdownMode};
+use crate::config::{
+    get_config_path, update_midi_device_in_config, MappingConfig, PulsePlexConfig, ShutdownMode,
+};
 
 #[derive(Parser)]
 #[command(
@@ -39,15 +45,19 @@ struct Args {
 enum Commands {
     /// Start the PulsePlex daemon (default)
     Run {
-        /// Path to configuration file
-        #[arg(short, long, default_value = "pulseplex.toml")]
-        config: String,
+        /// Path to configuration file (Overrides env vars)
+        #[arg(short, long)]
+        config: Option<String>,
+
+        /// Force the interactive MIDI device selection prompt
+        #[arg(short, long)]
+        select_midi: bool,
     },
     /// Validate the configuration file and check for DMX collisions
     Check {
-        /// Path to configuration file
-        #[arg(short, long, default_value = "pulseplex.toml")]
-        config: String,
+        /// Path to configuration file (Overrides env vars)
+        #[arg(short, long)]
+        config: Option<String>,
     },
 }
 
@@ -64,47 +74,108 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     match cli.command.unwrap_or(Commands::Run {
-        config: "pulseplex.toml".to_string(),
+        config: None,
+        select_midi: false,
     }) {
         Commands::Check { config } => {
-            handle_check(&config)?;
+            let path = get_config_path(config.as_ref())?;
+            handle_check(path.to_string_lossy().as_ref())?;
         }
-        Commands::Run { config } => {
-            run_daemon(config)?;
+        Commands::Run {
+            config,
+            select_midi,
+        } => {
+            let path = get_config_path(config.as_ref())?;
+
+            // Ensure the configuration directory exists
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            run_daemon(path, select_midi)?;
         }
     }
 
     Ok(())
 }
 
-fn run_daemon(config_path: String) -> anyhow::Result<()> {
-    let path_to_watch = PathBuf::from(&config_path);
-    let config = PulsePlexConfig::load(&config_path)?;
-    info!(
-        "Loaded configuration for MIDI device: {}",
-        config.midi.device_name
-    );
+fn run_daemon(config_path: PathBuf, force_select: bool) -> anyhow::Result<()> {
+    // Canonicalize paths for consistent hot-reload comparison
+    let config_path = if config_path.exists() {
+        config_path.canonicalize()?
+    } else {
+        config_path
+    };
+    let config_path_str = config_path.to_string_lossy().to_string();
 
+    let mut config = PulsePlexConfig::load(&config_path_str)?;
+
+    // MIDI detection should follow setup_midi's substring matching
+    let available_devices = pulseplex_midi::list_midi_devices()?;
+    let current_spec = &config.midi.device_name;
+
+    let device_found = if current_spec.is_empty() {
+        false
+    } else {
+        // Match if any available device contains the config string
+        available_devices.iter().any(|d| d.contains(current_spec))
+    };
+
+    if !device_found || force_select {
+        if available_devices.is_empty() {
+            bail!("No MIDI input devices detected.");
+        }
+
+        let chosen_device = if std::io::stdin().is_terminal() {
+            // Interactive: Prompt user
+            let selection = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("Select MIDI device")
+                .items(&available_devices)
+                .default(0)
+                .interact()?;
+            available_devices[selection].clone()
+        } else {
+            // Non-interactive (systemd/CI): Auto-select if unambiguous
+            if available_devices.len() == 1 {
+                let dev = available_devices[0].clone();
+                warn!("Headless mode: Auto-selecting only device: {}", dev);
+                dev
+            } else {
+                bail!(
+                    "Headless mode detected with no valid MIDI config.\n\
+                     Available devices: {:?}\n\
+                     Update 'device_name' in {} to continue.",
+                    available_devices,
+                    config_path_str
+                );
+            }
+        };
+
+        update_midi_device_in_config(&config_path_str, &chosen_device)?;
+        config.midi.device_name = chosen_device;
+    }
+
+    // Hot-Reloading
     let (config_tx, config_rx) = crossbeam_channel::unbounded();
-
-    let closure_path = path_to_watch.clone();
-
+    let c_path = config_path.clone();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
-            // Send a reload ping for any modified path that ends with our config
-            if event.paths.iter().any(|p| p.ends_with(&closure_path)) {
+            // Check if the modified file is our specific config file
+            if event
+                .paths
+                .iter()
+                .any(|p| p.canonicalize().map(|cp| cp == c_path).unwrap_or(false))
+            {
                 let _ = config_tx.send(());
             }
         }
     })?;
 
-    // Watch current dir
-    watcher.watch(
-        std::path::Path::new("."),
-        notify::RecursiveMode::NonRecursive,
-    )?;
-    info!("Hot-reloading enabled for {config_path}");
-
+    // Watch the parent directory of the config file
+    if let Some(parent) = config_path.parent() {
+        watcher.watch(parent, notify::RecursiveMode::NonRecursive)?;
+        info!("Watching for config changes in: {:?}", parent);
+    }
     let mut note_mappings: HashMap<u8, MappingConfig> = config
         .clone()
         .mapping
@@ -138,7 +209,6 @@ fn run_daemon(config_path: String) -> anyhow::Result<()> {
     info!("Network initialized. Target: {}", target_addr);
 
     let mut artnet = ArtNetBridge::new(config.artnet.universe);
-
     let sleeper = SpinSleeper::default();
     let mut active_lights: HashMap<u8, DecayEnvelope> = HashMap::new();
 
@@ -147,51 +217,41 @@ fn run_daemon(config_path: String) -> anyhow::Result<()> {
     let mut initial_state = [0u8; 512];
     if matches!(config.shutdown.mode, ShutdownMode::Restore) {
         info!("Capturing current lighting state for later restoration...");
-        socket.set_read_timeout(Some(Duration::from_millis(1000)))?;
-        // Note: might need to bind to the Art-Net port 6454 to receive if
-        // another controller is broadcasting
-        let mut buf = [0u8; 1024];
-        if let Ok((amt, _)) = socket.recv_from(&mut buf) {
-            // Basic Art-Net header skip to get to the DMX payload
-            if amt > 18 {
-                initial_state.copy_from_slice(&buf[18..530]);
+
+        // Temporarily bind to the specific Art-Net port just to grab a snapshot
+        if let Ok(listener) = UdpSocket::bind("0.0.0.0:6454") {
+            listener.set_read_timeout(Some(Duration::from_millis(1000)))?;
+            let mut buf = [0u8; 1024];
+            if let Ok((amt, _)) = listener.recv_from(&mut buf) {
+                if amt > 18 {
+                    initial_state.copy_from_slice(&buf[18..530]);
+                    info!("Successfully captured background DMX state.");
+                }
+            } else {
+                warn!("Timeout waiting for background Art-Net traffic. Restore state will be a blackout.");
             }
+        } else {
+            warn!("Could not bind to port 6454 to capture state. Is another lighting software running?");
         }
-        // Back to non-blocking or blocking-only send
-        socket.set_read_timeout(None)?;
     }
 
     let mut last_tick = Instant::now();
     let mut next_deadline = last_tick + target_interval;
 
     while running.load(Ordering::SeqCst) {
-        // calculate our time since last tick
         let now = Instant::now();
         let delta_time = now.duration_since(last_tick);
         last_tick = now;
 
-        let mut needs_reload = false;
-        while config_rx.try_recv().is_ok() {
-            needs_reload = true;
-        }
-
-        if needs_reload {
-            info!(
-                "config change detected in {}, attempting reload...",
-                config_path
-            );
-            match PulsePlexConfig::load(&config_path) {
-                Ok(new_config) => {
-                    // Swap mappings
-                    note_mappings = new_config
-                        .mapping
-                        .into_iter()
-                        .map(|m| (m.note, m))
-                        .collect();
-                }
-                Err(e) => {
-                    warn!("Failed to reload config (keeping previous state): {}", e);
-                }
+        if config_rx.try_recv().is_ok() {
+            info!("Reloading configuration...");
+            if let Ok(new_config) = PulsePlexConfig::load(&config_path_str) {
+                note_mappings = new_config
+                    .mapping
+                    .into_iter()
+                    .map(|m| (m.note, m))
+                    .collect();
+                info!("Reload successful.");
             }
         }
 
@@ -223,6 +283,7 @@ fn run_daemon(config_path: String) -> anyhow::Result<()> {
                 }
             }
         }
+
         // update decay envelopes
         active_lights.retain(|note, env| {
             env.tick(delta_time);
@@ -235,12 +296,9 @@ fn run_daemon(config_path: String) -> anyhow::Result<()> {
             }
         });
 
-        // if !active_lights.is_empty() { ... }
-
         // output to Art-Net
         artnet.clear_data();
         for (note, env) in &active_lights {
-            // simple mapping: Note 36 (Kick Drum, C1) -> DMX Ch0
             if let Some(mapping) = note_mappings.get(note) {
                 if let Some([r, g, b]) = mapping.color {
                     artnet.set_channel(mapping.dmx_channel, (r as f32 * env.intensity) as u8);
@@ -257,11 +315,9 @@ fn run_daemon(config_path: String) -> anyhow::Result<()> {
         artnet.increment_sequence();
 
         let sleep_start = Instant::now();
-
         if sleep_start < next_deadline {
             sleeper.sleep(next_deadline.duration_since(sleep_start));
         } else {
-            // Missed our deadline and overslept
             warn!(
                 "Frame drop detected! Work took longer than {:?}",
                 target_interval
@@ -269,10 +325,9 @@ fn run_daemon(config_path: String) -> anyhow::Result<()> {
         }
 
         // advance the deadline for the next frame
-        // using `.max(Instant::now))` to prevent a catch-up stampede
-        // if we lag too heavily, we just reset the clock and move on
         next_deadline = Instant::now().max(next_deadline) + target_interval;
     }
+
     perform_shutdown(&config, &socket, &target_addr, &mut artnet, &initial_state)?;
 
     info!("PulsePlex shut down cleanly.");
@@ -302,8 +357,6 @@ fn perform_shutdown(
         }
         ShutdownMode::Restore => {
             info!("Shutting down: Restoring previous state");
-            // Direct copy of the snapshot we took at startup
-            // (assuming ArtNetBridge allows raw buffer setting)
             artnet.set_raw_data(initial_state);
         }
     }
@@ -324,8 +377,6 @@ fn handle_check(path: &str) -> anyhow::Result<()> {
     match SocketAddr::from_str(&config.artnet.target_ip) {
         Ok(_) => println!("✅ Network: Target IP/Port format is valid"),
         Err(_) => {
-            // If SocketAddr fails, check if it's because it's a hostname
-            // (Only if you want to support hostnames but warn about shorthand)
             if config.artnet.target_ip.to_socket_addrs().is_ok() {
                 println!(
                     "⚠️  Network: '{}' is a valid hostname/shorthand, but not a literal IP",
@@ -343,7 +394,6 @@ fn handle_check(path: &str) -> anyhow::Result<()> {
     // 3. Test DMX Bounds and Overlaps
     let mut used_channels = std::collections::HashMap::new();
     for mapping in &config.mapping {
-        // Assume RGB takes 3 channels, Dimmer takes 1
         let span = if mapping.color.is_some() { 3 } else { 1 };
 
         for offset in 0..span {
