@@ -1,7 +1,11 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::{env, fs};
+
 use anyhow::{Ok, Result};
 use pulseplex_core::{DecayProfile, VelocityCurve};
 use serde::Deserialize;
-use std::{collections::HashMap, fs};
+use toml_edit::{value, DocumentMut};
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct PulsePlexConfig {
@@ -55,4 +59,43 @@ impl PulsePlexConfig {
             .map_err(|e| anyhow::anyhow!("Failed to parse TOML: {}", e))?;
         Ok(config)
     }
+}
+
+pub fn update_midi_device_in_config(config_path: &str, new_device: &str) -> anyhow::Result<()> {
+    let contents = fs::read_to_string(config_path)?;
+    let mut doc = contents
+        .parse::<DocumentMut>()
+        .map_err(|e| anyhow::anyhow!("Failed to parse config for editing: {}", e))?;
+
+    // Safely update the value while preserving all surrounding comments and whitespace
+    doc["midi"]["device_name"] = value(new_device);
+
+    fs::write(config_path, doc.to_string())?;
+    Ok(())
+}
+
+pub fn get_config_path(cli_override: Option<&String>) -> PathBuf {
+    // 1. Explicit CLI argument wins
+    if let Some(path) = cli_override {
+        return PathBuf::from(path);
+    }
+
+    // 2. App-specific environment variable
+    if let Result::Ok(path) = env::var("PULSEPLEX_CONFIG_HOME") {
+        return PathBuf::from(path).join("pulseplex.toml");
+    }
+
+    // 3. XDG standard or fallback to ~/.config
+    let xdg_config = env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            // Quick cross-platform home directory fetch
+            let home = env::var("HOME")
+                .or_else(|_| env::var("USERPROFILE"))
+                .expect("Could not determine home directory");
+            PathBuf::from(home).join(".config")
+        });
+
+    // 4. Final path: ~/.config/pulseplex/pulseplex.toml
+    xdg_config.join("pulseplex").join("pulseplex.toml")
 }
