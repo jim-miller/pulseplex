@@ -247,7 +247,13 @@ fn run_daemon(config_path: PathBuf, force_select: bool) -> anyhow::Result<()> {
         let delta_time = now.duration_since(last_tick);
         last_tick = now;
 
-        if config_rx.try_recv().is_ok() {
+        // Drain the hot-reload channel completely to debounce rapid file save events
+        let mut needs_reload = false;
+        while config_rx.try_recv().is_ok() {
+            needs_reload = true;
+        }
+
+        if needs_reload {
             info!("Reloading configuration...");
             if let Ok(new_config) = PulsePlexConfig::load(&config_path_str) {
                 note_mappings = new_config
