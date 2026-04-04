@@ -223,9 +223,13 @@ fn run_daemon(config_path: PathBuf, force_select: bool) -> anyhow::Result<()> {
             listener.set_read_timeout(Some(Duration::from_millis(1000)))?;
             let mut buf = [0u8; 1024];
             if let Ok((amt, _)) = listener.recv_from(&mut buf) {
-                if amt > 18 {
-                    initial_state.copy_from_slice(&buf[18..530]);
-                    info!("Successfully captured background DMX state.");
+                if amt >= 530 {
+                    if let Some(dmx_data) = buf[..amt].get(18..530) {
+                        initial_state.copy_from_slice(dmx_data);
+                        info!("Successfully captured background DMX state.");
+                    }
+                } else {
+                    warn!("Received short Art-Net packet while capturing background state. Restore state will be a blackout.");
                 }
             } else {
                 warn!("Timeout waiting for background Art-Net traffic. Restore state will be a blackout.");
