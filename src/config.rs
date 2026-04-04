@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{env, fs};
 
-use anyhow::{Ok, Result};
+use anyhow::Result;
 use pulseplex_core::{DecayProfile, VelocityCurve};
 use serde::Deserialize;
 use toml_edit::{value, DocumentMut};
@@ -61,7 +61,7 @@ impl PulsePlexConfig {
     }
 }
 
-pub fn update_midi_device_in_config(config_path: &str, new_device: &str) -> anyhow::Result<()> {
+pub fn update_midi_device_in_config(config_path: &str, new_device: &str) -> Result<()> {
     let contents = fs::read_to_string(config_path)?;
     let mut doc = contents
         .parse::<DocumentMut>()
@@ -70,32 +70,43 @@ pub fn update_midi_device_in_config(config_path: &str, new_device: &str) -> anyh
     // Safely update the value while preserving all surrounding comments and whitespace
     doc["midi"]["device_name"] = value(new_device);
 
-    fs::write(config_path, doc.to_string())?;
+    // Atomic write: Save to a temp file then swap
+    let path = Path::new(config_path);
+    let tmp_path = path.with_extension("toml.tmp");
+
+    fs::write(&tmp_path, doc.to_string())?;
+
+    // Rename guarantees atomicity on POSIX systems if both are on the same filesystem
+    fs::rename(&tmp_path, path).map_err(|e| {
+        // Attempt to clean up the temp file if rename fails
+        let _ = fs::remove_file(&tmp_path);
+        anyhow::anyhow!("Failed to atomically replace config file: {}", e)
+    })?;
+
     Ok(())
 }
 
-pub fn get_config_path(cli_override: Option<&String>) -> PathBuf {
-    // 1. Explicit CLI argument wins
-    if let Some(path) = cli_override {
-        return PathBuf::from(path);
-    }
-
-    // 2. App-specific environment variable
-    if let Result::Ok(path) = env::var("PULSEPLEX_CONFIG_HOME") {
-        return PathBuf::from(path).join("pulseplex.toml");
-    }
-
-    // 3. XDG standard or fallback to ~/.config
-    let xdg_config = env::var("XDG_CONFIG_HOME")
+pub fn get_config_path(cli_override: Option<&String>) -> Result<PathBuf> {
+    cli_override
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            // Quick cross-platform home directory fetch
-            let home = env::var("HOME")
-                .or_else(|_| env::var("USERPROFILE"))
-                .expect("Could not determine home directory");
-            PathBuf::from(home).join(".config")
-        });
+        .or_else(|| {
+            env::var("PULSEPLEX_CONFIG_HOME")
+                .ok()
+                .map(|p| PathBuf::from(p).join("pulseplex.toml"))
+        })
+        .map(Ok)
+        .unwrap_or_else(|| {
+            let xdg_base = env::var("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|_| {
+                    env::var("HOME")
+                        .or_else(|_| env::var("USERPROFILE"))
+                        .map(|h| PathBuf::from(h).join(".config"))
+                })
+                .map_err(|_| {
+                    anyhow::anyhow!("Could not determine home directory from HOME or USERPROFILE")
+                })?;
 
-    // 4. Final path: ~/.config/pulseplex/pulseplex.toml
-    xdg_config.join("pulseplex").join("pulseplex.toml")
+            Ok(xdg_base.join("pulseplex").join("pulseplex.toml"))
+        })
 }
