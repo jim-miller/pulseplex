@@ -33,7 +33,7 @@ pub fn list_midi_devices() -> Result<Vec<String>> {
     Ok(device_names)
 }
 
-/// Finds a MIDI port index by substring match.
+/// Finds a MIDI input port by substring match.
 pub fn find_midi_port(midi_in: &midir::MidiInput, target_name: &str) -> Option<MidiInputPort> {
     for port in midi_in.ports() {
         if let Ok(name) = midi_in.port_name(&port) {
@@ -61,7 +61,7 @@ pub fn setup_midi(target_device: &str) -> anyhow::Result<MidiReceiver> {
     let _conn = midi_in
         .connect(
             &port,
-            "pulsepluex-read",
+            "pulseplex-read",
             move |_stamp, message, _| {
                 if message.len() >= 3 {
                     let status = message[0] & 0xF0;

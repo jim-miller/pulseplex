@@ -255,13 +255,18 @@ fn run_daemon(config_path: PathBuf, force_select: bool) -> anyhow::Result<()> {
 
         if needs_reload {
             info!("Reloading configuration...");
-            if let Ok(new_config) = PulsePlexConfig::load(&config_path_str) {
-                note_mappings = new_config
-                    .mapping
-                    .into_iter()
-                    .map(|m| (m.note, m))
-                    .collect();
-                info!("Reload successful.");
+            match PulsePlexConfig::load(&config_path_str) {
+                Ok(new_config) => {
+                    note_mappings = new_config
+                        .mapping
+                        .into_iter()
+                        .map(|m| (m.note, m))
+                        .collect();
+                    info!("Reload successful.");
+                }
+                Err(e) => {
+                    warn!("Reload failed: {}. Keeping previous configuration.", e);
+                }
             }
         }
 
