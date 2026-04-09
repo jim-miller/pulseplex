@@ -27,8 +27,10 @@ jobs:
         include:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
+            use_cross: true
           - target: aarch64-apple-darwin
             os: macos-latest
+            use_cross: false
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -43,4 +45,5 @@ jobs:
         with:
           bin: pulseplex
           target: ${{ matrix.target }}
+          cross: ${{ matrix.use_cross }}
           token: ${{ secrets.GITHUB_TOKEN }}
