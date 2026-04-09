@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install system dependencies
         run: |
@@ -22,12 +22,12 @@ jobs:
           sudo apt-get install -y libasound2-dev libjack-jackd2-dev pkg-config
 
       - name: Install minimal Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@a54c339952cd4ad0aa73838f9befc41020465a3a # stable
         with:
           components: clippy, rustfmt
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@822fdc4dd05491ef4969294616239103bd36c3b6 # v2.7.7
 
       - name: Check Formatting
         run: cargo fmt --all -- --check
