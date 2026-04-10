@@ -29,6 +29,32 @@ use spin_sleep::SpinSleeper;
 use tracing::{debug, info, trace, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+/// RAII Guard to ensure terminal state is restored on drop.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn new() -> io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(
+            io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::cursor::Hide
+        )?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(
+            io::stdout(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
 use crate::config::{
     get_config_path, update_midi_device_in_config, MappingConfig, PulsePlexConfig, ShutdownMode,
 };
@@ -138,17 +164,14 @@ fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(if cli.verbose { "trace" } else { "info" }));
 
-    // If TUI is enabled, we use a different logging approach to avoid messing up the UI
+    let registry = tracing_subscriber::registry().with(filter);
+
     if !cli.no_tui && std::io::stdout().is_terminal() {
-        // Logging to a file or discarding when TUI is active is common,
-        // but for now we'll just allow the daemon to run.
+        // Redirect logs to stderr when TUI is active to avoid corrupting the screen
+        registry.with(fmt::layer().with_writer(io::stderr)).init();
+    } else {
+        registry.with(fmt::layer()).init();
     }
-
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer())
-        .init();
-
     match cli.command.unwrap_or(Commands::Run {
         config: None,
         select_midi: false,
@@ -303,16 +326,14 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
     }
 
     // TUI Setup
-    let mut terminal = if use_tui && io::stdout().is_terminal() {
-        crossterm::terminal::enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        crossterm::execute!(
-            stdout,
-            crossterm::terminal::EnterAlternateScreen,
-            crossterm::cursor::Hide
-        )?;
-        let backend = CrosstermBackend::new(stdout);
-        Some(Terminal::new(backend)?)
+    let _guard = if use_tui && io::stdout().is_terminal() {
+        Some(TerminalGuard::new()?)
+    } else {
+        None
+    };
+
+    let mut terminal = if _guard.is_some() {
+        Some(Terminal::new(CrosstermBackend::new(io::stdout()))?)
     } else {
         None
     };
@@ -325,6 +346,22 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
         let now = Instant::now();
         let delta_time = now.duration_since(last_tick);
         last_tick = now;
+
+        // Poll for TUI events (like exit keys)
+        if terminal.is_some() {
+            while crossterm::event::poll(Duration::ZERO)? {
+                if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                    if key.code == crossterm::event::KeyCode::Char('q')
+                        || (key.code == crossterm::event::KeyCode::Char('c')
+                            && key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL))
+                    {
+                        running.store(false, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
 
         // Drain the hot-reload channel completely to debounce rapid file save events
         let mut needs_reload = false;
@@ -352,7 +389,9 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
         // drain the sources
         if let Ok(signals) = midi_source.poll() {
             for signal in signals {
-                dashboard_state.push_signal(signal);
+                if terminal.is_some() {
+                    dashboard_state.push_signal(signal);
+                }
                 match signal {
                     Signal::Trigger { id, velocity } => {
                         if let Some(mapping) = note_mappings.get(&id) {
@@ -419,13 +458,11 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
         artnet_sink.send_state(&dmx_frame)?;
 
         // Update TUI state
-        dashboard_state.dmx_channels = dmx_frame;
-        dashboard_state.active_notes = active_lights.len();
-
         if let Some(ref mut term) = terminal {
+            dashboard_state.dmx_channels = dmx_frame;
+            dashboard_state.active_notes = active_lights.len();
             term.draw(|f| ui(f, &dashboard_state))?;
         }
-
         let sleep_start = Instant::now();
         if sleep_start < next_deadline {
             sleeper.sleep(next_deadline.duration_since(sleep_start));
@@ -438,16 +475,6 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
 
         // advance the deadline for the next frame
         next_deadline = Instant::now().max(next_deadline) + target_interval;
-    }
-
-    // TUI Shutdown
-    if let Some(mut term) = terminal {
-        crossterm::execute!(
-            term.backend_mut(),
-            crossterm::terminal::LeaveAlternateScreen,
-            crossterm::cursor::Show
-        )?;
-        crossterm::terminal::disable_raw_mode()?;
     }
 
     perform_shutdown(&config, &mut artnet_sink, &initial_state)?;
