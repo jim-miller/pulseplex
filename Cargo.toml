@@ -28,6 +28,8 @@ ctrlc = "3.5.2"
 notify = "8.2.0"
 dialoguer = "0.12.0"
 toml_edit = "0.25.8"
+ratatui = "0.29.0"
+crossterm = { version = "0.28.1", features = ["event-stream"] }
 
 [workspace.dependencies]
 pulseplex-core = { path = "crates/pulseplex-core" }

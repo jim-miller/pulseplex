@@ -1,7 +1,7 @@
 mod config;
 
 use std::collections::HashMap;
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -17,6 +17,14 @@ use clap::{Parser, Subcommand};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::Select;
 use notify::Watcher;
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
+    Frame, Terminal,
+};
 use spin_sleep::SpinSleeper;
 use tracing::{debug, info, trace, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -38,6 +46,10 @@ struct Args {
     /// Enable verbose logging
     #[arg(short, long, global = true)]
     verbose: bool,
+
+    /// Disable the TUI dashboard
+    #[arg(long, global = true)]
+    no_tui: bool,
 }
 
 #[derive(Subcommand)]
@@ -93,12 +105,44 @@ impl LightSink for ArtNetSink {
     }
 }
 
+/// TUI State for real-time visualization.
+struct DashboardState {
+    dmx_channels: [u8; 512],
+    recent_signals: Vec<(Instant, Signal)>,
+    start_time: Instant,
+    active_notes: usize,
+}
+
+impl DashboardState {
+    fn new() -> Self {
+        Self {
+            dmx_channels: [0u8; 512],
+            recent_signals: Vec::new(),
+            start_time: Instant::now(),
+            active_notes: 0,
+        }
+    }
+
+    fn push_signal(&mut self, signal: Signal) {
+        self.recent_signals.push((Instant::now(), signal));
+        if self.recent_signals.len() > 10 {
+            self.recent_signals.remove(0);
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Args::parse();
 
     // Setup logging (verbose flag is global)
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(if cli.verbose { "trace" } else { "info" }));
+
+    // If TUI is enabled, we use a different logging approach to avoid messing up the UI
+    if !cli.no_tui && std::io::stdout().is_terminal() {
+        // Logging to a file or discarding when TUI is active is common,
+        // but for now we'll just allow the daemon to run.
+    }
 
     tracing_subscriber::registry()
         .with(filter)
@@ -124,14 +168,14 @@ fn main() -> anyhow::Result<()> {
                 std::fs::create_dir_all(parent)?;
             }
 
-            run_daemon(path, select_midi)?;
+            run_daemon(path, select_midi, !cli.no_tui)?;
         }
     }
 
     Ok(())
 }
 
-fn run_daemon(config_path: PathBuf, force_select: bool) -> anyhow::Result<()> {
+fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow::Result<()> {
     // Canonicalize paths for consistent hot-reload comparison
     let config_path = if config_path.exists() {
         config_path.canonicalize()?
@@ -222,7 +266,6 @@ fn run_daemon(config_path: PathBuf, force_select: bool) -> anyhow::Result<()> {
     let r = running.clone();
 
     ctrlc::set_handler(move || {
-        info!("Shutdown signal received...");
         r.store(false, Ordering::SeqCst);
     })?;
 
@@ -259,6 +302,22 @@ fn run_daemon(config_path: PathBuf, force_select: bool) -> anyhow::Result<()> {
         }
     }
 
+    // TUI Setup
+    let mut terminal = if use_tui && io::stdout().is_terminal() {
+        crossterm::terminal::enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        crossterm::execute!(
+            stdout,
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::cursor::Hide
+        )?;
+        let backend = CrosstermBackend::new(stdout);
+        Some(Terminal::new(backend)?)
+    } else {
+        None
+    };
+
+    let mut dashboard_state = DashboardState::new();
     let mut last_tick = Instant::now();
     let mut next_deadline = last_tick + target_interval;
 
@@ -293,6 +352,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool) -> anyhow::Result<()> {
         // drain the sources
         if let Ok(signals) = midi_source.poll() {
             for signal in signals {
+                dashboard_state.push_signal(signal);
                 match signal {
                     Signal::Trigger { id, velocity } => {
                         if let Some(mapping) = note_mappings.get(&id) {
@@ -358,10 +418,18 @@ fn run_daemon(config_path: PathBuf, force_select: bool) -> anyhow::Result<()> {
         // output
         artnet_sink.send_state(&dmx_frame)?;
 
+        // Update TUI state
+        dashboard_state.dmx_channels = dmx_frame;
+        dashboard_state.active_notes = active_lights.len();
+
+        if let Some(ref mut term) = terminal {
+            term.draw(|f| ui(f, &dashboard_state))?;
+        }
+
         let sleep_start = Instant::now();
         if sleep_start < next_deadline {
             sleeper.sleep(next_deadline.duration_since(sleep_start));
-        } else {
+        } else if terminal.is_none() {
             warn!(
                 "Frame drop detected! Work took longer than {:?}",
                 target_interval
@@ -372,10 +440,96 @@ fn run_daemon(config_path: PathBuf, force_select: bool) -> anyhow::Result<()> {
         next_deadline = Instant::now().max(next_deadline) + target_interval;
     }
 
+    // TUI Shutdown
+    if let Some(mut term) = terminal {
+        crossterm::execute!(
+            term.backend_mut(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show
+        )?;
+        crossterm::terminal::disable_raw_mode()?;
+    }
+
     perform_shutdown(&config, &mut artnet_sink, &initial_state)?;
 
     info!("PulsePlex shut down cleanly.");
     Ok(())
+}
+
+fn ui(f: &mut Frame, state: &DashboardState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header
+            Constraint::Min(10),   // Main View (DMX + Signals)
+            Constraint::Length(3), // Footer
+        ])
+        .split(f.area());
+
+    // Header
+    let uptime = state.start_time.elapsed();
+    let header = Paragraph::new(format!(
+        " PulsePlex v{} | Uptime: {}s | Active Envelopes: {}",
+        env!("CARGO_PKG_VERSION"),
+        uptime.as_secs(),
+        state.active_notes
+    ))
+    .block(Block::default().borders(Borders::ALL).title(" Status "));
+    f.render_widget(header, chunks[0]);
+
+    // Main View
+    let main_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .split(chunks[1]);
+
+    // DMX Visualization (Intensity grid)
+    let dmx_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" DMX Output (Universe 0) ");
+    let mut dmx_lines = Vec::new();
+    for row in 0..16 {
+        let mut spans = Vec::new();
+        for col in 0..32 {
+            let idx = row * 32 + col;
+            let val = state.dmx_channels[idx];
+            let color = if val == 0 {
+                Color::DarkGray
+            } else {
+                Color::Rgb(val, val, val)
+            };
+            spans.push(Span::styled("■ ", Style::default().fg(color)));
+        }
+        dmx_lines.push(Line::from(spans));
+    }
+    let dmx_para = Paragraph::new(dmx_lines).block(dmx_block);
+    f.render_widget(dmx_para, main_chunks[0]);
+
+    // Signal Log
+    let signal_items: Vec<ListItem> = state
+        .recent_signals
+        .iter()
+        .rev()
+        .map(|(_, sig)| {
+            let text = match sig {
+                Signal::Trigger { id, velocity } => format!("Trigger ID: {} Vel: {}", id, velocity),
+                Signal::Release { id } => format!("Release ID: {}", id),
+                Signal::Clock => "Clock Tick".to_string(),
+            };
+            ListItem::new(text)
+        })
+        .collect();
+    let signal_list = List::new(signal_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Recent Signals "),
+    );
+    f.render_widget(signal_list, main_chunks[1]);
+
+    // Footer
+    let footer = Paragraph::new(" Press Ctrl+C to Exit | Hot-reloading config active ")
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(footer, chunks[2]);
 }
 
 fn perform_shutdown(
@@ -492,10 +646,6 @@ mod tests {
         use pulseplex_core::MockSink;
 
         let config = PulsePlexConfig {
-            shutdown: crate::config::ShutdownConfig {
-                mode: ShutdownMode::Blackout,
-                defaults: None,
-            },
             midi: crate::config::MidiConfig {
                 device_name: "".to_string(),
             },
@@ -504,6 +654,10 @@ mod tests {
                 universe: 0,
             },
             mapping: vec![],
+            shutdown: crate::config::ShutdownConfig {
+                mode: ShutdownMode::Blackout,
+                defaults: None,
+            },
         };
         let mut sink = MockSink::default();
         let initial_state = [255u8; 512];
@@ -518,10 +672,6 @@ mod tests {
         use pulseplex_core::MockSink;
 
         let config = PulsePlexConfig {
-            shutdown: crate::config::ShutdownConfig {
-                mode: ShutdownMode::Restore,
-                defaults: None,
-            },
             midi: crate::config::MidiConfig {
                 device_name: "".to_string(),
             },
@@ -530,6 +680,10 @@ mod tests {
                 universe: 0,
             },
             mapping: vec![],
+            shutdown: crate::config::ShutdownConfig {
+                mode: ShutdownMode::Restore,
+                defaults: None,
+            },
         };
         let mut sink = MockSink::default();
         let initial_state = [128u8; 512];
