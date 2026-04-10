@@ -5,7 +5,7 @@ all: fmt clippy test
 
 # Check the project for compilation errors
 check:
-    cargo check
+    cargo check --workspace
 
 # Format all files in the workspace
 fmt:
