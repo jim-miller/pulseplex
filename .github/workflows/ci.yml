@@ -22,12 +22,12 @@ jobs:
           sudo apt-get install -y libasound2-dev libjack-jackd2-dev pkg-config
 
       - name: Install minimal Rust toolchain
-        uses: dtolnay/rust-toolchain@a54c339952cd4ad0aa73838f9befc41020465a3a # stable
+        uses: dtolnay/rust-toolchain@e97e2d8d05a3c30f11c0a1506da7d44c32c56691 # stable
         with:
           components: clippy, rustfmt
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@822fdc4dd05491ef4969294616239103bd36c3b6 # v2.7.7
+        uses: Swatinem/rust-cache@c19371183f0518d4597c42140549696224647ba9 # v2.9.1
 
       - name: Check Formatting
         run: cargo fmt --all -- --check
