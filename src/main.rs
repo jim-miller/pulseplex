@@ -9,12 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pulseplex_core::{ArtNetBridge, DecayEnvelope};
-use pulseplex_midi::{setup_midi, MidiSignal};
+use pulseplex_core::{ArtNetBridge, DecayEnvelope, EventSource, LightSink, Signal};
+use pulseplex_midi::setup_midi;
 
 use anyhow::bail;
 use clap::{Parser, Subcommand};
-use crossbeam_channel::TryRecvError;
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::Select;
 use notify::Watcher;
@@ -59,6 +58,39 @@ enum Commands {
         #[arg(short, long)]
         config: Option<String>,
     },
+}
+
+/// A wrapper that implements LightSink for Art-Net UDP output.
+pub struct ArtNetSink {
+    socket: UdpSocket,
+    addr: SocketAddr,
+    bridge: ArtNetBridge,
+}
+
+impl ArtNetSink {
+    pub fn new(universe: u16, target_ip: &str) -> anyhow::Result<Self> {
+        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        socket.set_broadcast(true)?;
+        let addr = target_ip
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Could not parse target_ip address"))?;
+
+        Ok(Self {
+            socket,
+            addr,
+            bridge: ArtNetBridge::new(universe),
+        })
+    }
+}
+
+impl LightSink for ArtNetSink {
+    fn send_state(&mut self, state: &[u8; 512]) -> anyhow::Result<()> {
+        self.bridge.set_raw_data(state);
+        self.socket.send_to(self.bridge.as_bytes(), self.addr)?;
+        self.bridge.increment_sequence();
+        Ok(())
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -196,23 +228,11 @@ fn run_daemon(config_path: PathBuf, force_select: bool) -> anyhow::Result<()> {
 
     info!("Starting PulsePlex daemon");
 
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
-    socket.set_broadcast(true)?;
+    let mut artnet_sink = ArtNetSink::new(config.artnet.universe, &config.artnet.target_ip)?;
+    let mut midi_source = setup_midi(&config.midi.device_name)?;
 
-    let target_addr = config
-        .artnet
-        .target_ip
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Could not parse target_ip address"))?;
-
-    info!("Network initialized. Target: {}", target_addr);
-
-    let mut artnet = ArtNetBridge::new(config.artnet.universe);
     let sleeper = SpinSleeper::default();
     let mut active_lights: HashMap<u8, DecayEnvelope> = HashMap::new();
-
-    let midi_input = setup_midi(&config.midi.device_name)?;
 
     let mut initial_state = [0u8; 512];
     if matches!(config.shutdown.mode, ShutdownMode::Restore) {
@@ -270,31 +290,31 @@ fn run_daemon(config_path: PathBuf, force_select: bool) -> anyhow::Result<()> {
             }
         }
 
-        // drain the MIDI queue
-        loop {
-            match midi_input.rx.try_recv() {
-                Ok(MidiSignal::NoteOn { note, velocity }) => {
-                    if let Some(mapping) = note_mappings.get(&note) {
-                        debug!("Received: Note: {} Velocity: {}", note, velocity);
+        // drain the sources
+        if let Ok(signals) = midi_source.poll() {
+            for signal in signals {
+                match signal {
+                    Signal::Trigger { id, velocity } => {
+                        if let Some(mapping) = note_mappings.get(&id) {
+                            debug!("Trigger: ID: {} Velocity: {}", id, velocity);
 
-                        let mut env = DecayEnvelope::new(
-                            mapping.decay_seconds,
-                            mapping.velocity_curve,
-                            mapping.decay_profile,
-                        );
-                        env.trigger(velocity);
-                        active_lights.insert(note, env);
-                    } else {
-                        trace!("Ignored unmapped note: {}", note);
+                            let mut env = DecayEnvelope::new(
+                                mapping.decay_seconds,
+                                mapping.velocity_curve,
+                                mapping.decay_profile,
+                            );
+                            env.trigger(velocity);
+                            active_lights.insert(id, env);
+                        } else {
+                            trace!("Ignored unmapped trigger: {}", id);
+                        }
                     }
-                }
-                Ok(MidiSignal::NoteOff { note }) => {
-                    trace!("NoteOff: {}", note);
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    warn!("MIDI hardware disconnected!");
-                    break;
+                    Signal::Release { id } => {
+                        trace!("Release: {}", id);
+                    }
+                    Signal::Clock => {
+                        trace!("Clock Tick");
+                    }
                 }
             }
         }
@@ -311,23 +331,32 @@ fn run_daemon(config_path: PathBuf, force_select: bool) -> anyhow::Result<()> {
             }
         });
 
-        // output to Art-Net
-        artnet.clear_data();
+        // build the DMX frame
+        let mut dmx_frame = [0u8; 512];
         for (note, env) in &active_lights {
             if let Some(mapping) = note_mappings.get(note) {
                 if let Some([r, g, b]) = mapping.color {
-                    artnet.set_channel(mapping.dmx_channel, (r as f32 * env.intensity) as u8);
-                    artnet.set_channel(mapping.dmx_channel + 1, (g as f32 * env.intensity) as u8);
-                    artnet.set_channel(mapping.dmx_channel + 2, (b as f32 * env.intensity) as u8);
-                } else {
-                    artnet.set_channel(mapping.dmx_channel, env.dmx_value());
+                    let r_val = (r as f32 * env.intensity) as u8;
+                    let g_val = (g as f32 * env.intensity) as u8;
+                    let b_val = (b as f32 * env.intensity) as u8;
+
+                    if mapping.dmx_channel < 512 {
+                        dmx_frame[mapping.dmx_channel] = r_val;
+                    }
+                    if mapping.dmx_channel + 1 < 512 {
+                        dmx_frame[mapping.dmx_channel + 1] = g_val;
+                    }
+                    if mapping.dmx_channel + 2 < 512 {
+                        dmx_frame[mapping.dmx_channel + 2] = b_val;
+                    }
+                } else if mapping.dmx_channel < 512 {
+                    dmx_frame[mapping.dmx_channel] = env.dmx_value();
                 }
             }
         }
 
-        // send out to DMX
-        socket.send_to(artnet.as_bytes(), target_addr)?;
-        artnet.increment_sequence();
+        // output
+        artnet_sink.send_state(&dmx_frame)?;
 
         let sleep_start = Instant::now();
         if sleep_start < next_deadline {
@@ -343,7 +372,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool) -> anyhow::Result<()> {
         next_deadline = Instant::now().max(next_deadline) + target_interval;
     }
 
-    perform_shutdown(&config, &socket, &target_addr, &mut artnet, &initial_state)?;
+    perform_shutdown(&config, &mut artnet_sink, &initial_state)?;
 
     info!("PulsePlex shut down cleanly.");
     Ok(())
@@ -351,33 +380,34 @@ fn run_daemon(config_path: PathBuf, force_select: bool) -> anyhow::Result<()> {
 
 fn perform_shutdown(
     config: &PulsePlexConfig,
-    socket: &UdpSocket,
-    addr: &SocketAddr,
-    artnet: &mut ArtNetBridge,
+    sink: &mut dyn LightSink,
     initial_state: &[u8; 512],
 ) -> anyhow::Result<()> {
+    let mut final_frame = [0u8; 512];
+
     match config.shutdown.mode {
         ShutdownMode::Blackout => {
             info!("Shutting down: Blackout");
-            artnet.clear_data();
+            // final_frame is already all zeros
         }
         ShutdownMode::Default => {
             info!("Shutting down: Applying default scene");
-            artnet.clear_data();
             if let Some(defaults) = &config.shutdown.defaults {
                 for (ch, val) in defaults {
-                    artnet.set_channel(*ch, *val);
+                    if *ch < 512 {
+                        final_frame[*ch] = *val;
+                    }
                 }
             }
         }
         ShutdownMode::Restore => {
             info!("Shutting down: Restoring previous state");
-            artnet.set_raw_data(initial_state);
+            final_frame.copy_from_slice(initial_state);
         }
     }
 
     // Send the final "Exit Frame"
-    socket.send_to(artnet.as_bytes(), addr)?;
+    sink.send_state(&final_frame)?;
     Ok(())
 }
 
@@ -434,4 +464,108 @@ fn handle_check(path: &str) -> anyhow::Result<()> {
     println!("✅ DMX Mappings: All notes within 0-511 range");
     info!("Configuration check passed.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_artnet_sink_creation() {
+        let sink = ArtNetSink::new(1, "127.0.0.1:6454");
+        assert!(sink.is_ok());
+
+        let invalid_sink = ArtNetSink::new(1, "invalid_ip");
+        assert!(invalid_sink.is_err());
+    }
+
+    #[test]
+    fn test_artnet_sink_send_state() {
+        let mut sink = ArtNetSink::new(1, "127.0.0.1:6454").unwrap();
+        let state = [42u8; 512];
+        let result = sink.send_state(&state);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_perform_shutdown_blackout() {
+        use pulseplex_core::MockSink;
+
+        let config = PulsePlexConfig {
+            shutdown: crate::config::ShutdownConfig {
+                mode: ShutdownMode::Blackout,
+                defaults: None,
+            },
+            midi: crate::config::MidiConfig {
+                device_name: "".to_string(),
+            },
+            artnet: crate::config::ArtNetConfig {
+                target_ip: "".to_string(),
+                universe: 0,
+            },
+            mapping: vec![],
+        };
+        let mut sink = MockSink::default();
+        let initial_state = [255u8; 512];
+
+        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
+        assert_eq!(sink.frames.len(), 1);
+        assert_eq!(sink.frames[0][0], 0); // Blackout frame
+    }
+
+    #[test]
+    fn test_perform_shutdown_restore() {
+        use pulseplex_core::MockSink;
+
+        let config = PulsePlexConfig {
+            shutdown: crate::config::ShutdownConfig {
+                mode: ShutdownMode::Restore,
+                defaults: None,
+            },
+            midi: crate::config::MidiConfig {
+                device_name: "".to_string(),
+            },
+            artnet: crate::config::ArtNetConfig {
+                target_ip: "".to_string(),
+                universe: 0,
+            },
+            mapping: vec![],
+        };
+        let mut sink = MockSink::default();
+        let initial_state = [128u8; 512];
+
+        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
+        assert_eq!(sink.frames.len(), 1);
+        assert_eq!(sink.frames[0][0], 128); // Restore frame
+    }
+
+    #[test]
+    fn test_perform_shutdown_default() {
+        use pulseplex_core::MockSink;
+
+        let mut defaults = HashMap::new();
+        defaults.insert(5, 42);
+
+        let config = PulsePlexConfig {
+            midi: crate::config::MidiConfig {
+                device_name: "".to_string(),
+            },
+            artnet: crate::config::ArtNetConfig {
+                target_ip: "".to_string(),
+                universe: 0,
+            },
+            mapping: vec![],
+            shutdown: crate::config::ShutdownConfig {
+                mode: ShutdownMode::Default,
+                defaults: Some(defaults),
+            },
+        };
+        let mut sink = MockSink::default();
+        let initial_state = [255u8; 512];
+
+        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
+        assert_eq!(sink.frames.len(), 1);
+        assert_eq!(sink.frames[0][0], 0); // Default channel 0 is 0
+        assert_eq!(sink.frames[0][5], 42); // Configured default
+    }
 }

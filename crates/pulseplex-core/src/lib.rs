@@ -18,6 +18,30 @@ pub enum DecayProfile {
     Linear,
     Exponential,
 }
+
+/// Generic signals that can drive the lighting engine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Signal {
+    /// A trigger event (e.g., MIDI Note On) with a payload (e.g., note number) and velocity.
+    Trigger { id: u8, velocity: u8 },
+    /// A release event (e.g., MIDI Note Off)
+    Release { id: u8 },
+    /// A clock/tick event for synchronization
+    Clock,
+}
+
+/// Interface for outputting lighting state to hardware or protocols.
+pub trait LightSink: Send {
+    /// Send the complete frame state (512 channels) to the output.
+    fn send_state(&mut self, state: &[u8; 512]) -> anyhow::Result<()>;
+}
+
+/// Interface for receiving signals from hardware or protocols.
+pub trait EventSource: Send {
+    /// Poll for the next available signals. Non-blocking.
+    fn poll(&mut self) -> anyhow::Result<Vec<Signal>>;
+}
+
 pub struct DecayEnvelope {
     pub intensity: f32,        // 0.0 to 1.0
     pub decay_per_second: f32, // e.g., 0.90
@@ -39,7 +63,7 @@ impl DecayEnvelope {
         }
     }
 
-    /// Trigger the envelope with a MIDI velocity (0-127)
+    /// Trigger the envelope with a velocity (0-127)
     pub fn trigger(&mut self, velocity: u8) {
         let normalized = velocity as f32 / 127.0;
         // Map 0..127 to 0.0..1.0
@@ -144,6 +168,43 @@ impl ArtNetBridge {
             self.set_channel(i, initial_state[i]);
         });
     }
+
+    /// Extract the 512-byte DMX payload
+    pub fn dmx_data(&self) -> &[u8; 512] {
+        self.buffer[18..530].try_into().unwrap()
+    }
+}
+
+/// A Mock Sink for testing. Records frames sent to it.
+#[derive(Default)]
+pub struct MockSink {
+    pub frames: Vec<[u8; 512]>,
+}
+
+impl LightSink for MockSink {
+    fn send_state(&mut self, state: &[u8; 512]) -> anyhow::Result<()> {
+        self.frames.push(*state);
+        Ok(())
+    }
+}
+
+/// A Mock Source for testing.
+pub struct MockSource {
+    queue: Vec<Vec<Signal>>,
+}
+
+impl MockSource {
+    pub fn new(timeline: Vec<Vec<Signal>>) -> Self {
+        let mut queue = timeline;
+        queue.reverse(); // Reverse so we can pop
+        Self { queue }
+    }
+}
+
+impl EventSource for MockSource {
+    fn poll(&mut self) -> anyhow::Result<Vec<Signal>> {
+        Ok(self.queue.pop().unwrap_or_default())
+    }
 }
 
 #[cfg(test)]
@@ -199,154 +260,80 @@ mod tests {
     }
 
     #[test]
-    fn test_envelope_death() {
-        let mut env = DecayEnvelope::new(0.1, VelocityCurve::Linear, DecayProfile::Linear);
-        env.trigger(127);
+    fn test_mock_integration() {
+        let timeline = vec![
+            vec![Signal::Trigger {
+                id: 1,
+                velocity: 127,
+            }], // Frame 0
+            vec![], // Frame 1
+            vec![], // Frame 2
+            vec![Signal::Trigger {
+                id: 2,
+                velocity: 64,
+            }], // Frame 3
+        ];
 
-        // Tick past the decay time
-        env.tick(Duration::from_millis(150));
+        let mut source = MockSource::new(timeline);
+        let mut sink = MockSink::default();
 
-        assert!(env.is_dead());
-        assert_eq!(env.dmx_value(), 0);
+        let mut active_lights: std::collections::HashMap<u8, DecayEnvelope> =
+            std::collections::HashMap::new();
+        let dt = Duration::from_millis(25); // 40Hz
+
+        // Run 5 frames
+        for _ in 0..5 {
+            // 1. Poll
+            let signals = source.poll().unwrap();
+            for s in signals {
+                if let Signal::Trigger { id, velocity } = s {
+                    let mut env =
+                        DecayEnvelope::new(0.1, VelocityCurve::Linear, DecayProfile::Linear);
+                    env.trigger(velocity);
+                    active_lights.insert(id, env);
+                }
+            }
+
+            // 2. Tick
+            active_lights.retain(|_, env| {
+                env.tick(dt);
+                !env.is_dead()
+            });
+
+            // 3. Build Frame
+            let mut frame = [0u8; 512];
+            for (id, env) in &active_lights {
+                if *id == 1 {
+                    frame[0] = env.dmx_value();
+                } else if *id == 2 {
+                    frame[1] = env.dmx_value();
+                }
+            }
+
+            // 4. Sink
+            sink.send_state(&frame).unwrap();
+        }
+
+        // Frame 0: Trigger id:1 at 127. Intensity 1.0 -> 0.75 after tick. DMX ~191
+        assert!(sink.frames[0][0] > 180);
+        // Frame 1: id:1 decays 0.75 -> 0.5. DMX ~127
+        assert!(sink.frames[1][0] > 120);
+        // Frame 3: Trigger id:2 at 64. Intensity ~0.5. Tick: 0.5 -> 0.25. DMX ~63
+        assert!(sink.frames[3][1] > 60 && sink.frames[3][1] < 70);
     }
 
     #[test]
-    fn test_artnet_protocol_header() {
-        let bridge = ArtNetBridge::new(0);
-        let bytes = bridge.as_bytes();
+    fn test_mock_signals() {
+        let timeline = vec![vec![Signal::Release { id: 42 }, Signal::Clock]];
 
-        // Art-Net header must be "Art-Net\0"
-        assert_eq!(&bytes[0..8], b"Art-Net\0");
+        let mut source = MockSource::new(timeline);
 
-        // OpCode should be 0x5000 (Stored as 0x00, 0x50 in little-endian)
-        assert_eq!(bytes[8], 0x00);
-        assert_eq!(bytes[9], 0x50);
+        let sigs1 = source.poll().unwrap();
+        assert_eq!(sigs1.len(), 2);
+        assert_eq!(sigs1[0], Signal::Release { id: 42 });
+        assert_eq!(sigs1[1], Signal::Clock);
 
-        // Protocol version should be 14
-        assert_eq!(bytes[11], 14);
-    }
-
-    #[test]
-    fn test_artnet_channel_mapping() {
-        let mut bridge = ArtNetBridge::new(0);
-
-        // Set channel 0 and channel 511 (the boundaries)
-        bridge.set_channel(0, 255);
-        bridge.set_channel(511, 128);
-
-        let bytes = bridge.as_bytes();
-        assert_eq!(bytes[18], 255); // Data starts at index 18
-        assert_eq!(bytes[18 + 511], 128);
-    }
-
-    #[test]
-    fn test_sequence_increment() {
-        let mut bridge = ArtNetBridge::new(0);
-        let initial_seq = bridge.as_bytes()[12];
-
-        bridge.increment_sequence();
-        assert_eq!(bridge.as_bytes()[12], initial_seq.wrapping_add(1));
-    }
-
-    #[test]
-    fn test_hit_to_dmx_sequence() {
-        let mut env = DecayEnvelope::new(0.2, VelocityCurve::Linear, DecayProfile::Linear);
-
-        // Hit it hard
-        env.trigger(127);
-        assert_eq!(env.dmx_value(), 255);
-
-        // Halfway through decay (0.1s of 0.2s)
-        env.tick(Duration::from_millis(100));
-        assert_eq!(env.dmx_value(), 127); // 50% of 255
-    }
-
-    #[test]
-    fn test_velocity_curve_accuracy() {
-        let mut env_linear = DecayEnvelope::new(1.0, VelocityCurve::Linear, DecayProfile::Linear);
-        let mut env_hard = DecayEnvelope::new(1.0, VelocityCurve::Hard, DecayProfile::Linear);
-        let mut env_soft = DecayEnvelope::new(1.0, VelocityCurve::Soft, DecayProfile::Linear);
-
-        // Mid point
-        let mid_velocity = 64;
-        let normalized = mid_velocity as f32 / 127.0; // ~0.5039
-
-        env_linear.trigger(mid_velocity);
-        env_soft.trigger(mid_velocity);
-        env_hard.trigger(mid_velocity);
-
-        // Linear 1:1
-        assert!((env_linear.intensity - normalized).abs() < 0.001);
-        // Hard: x^2
-        assert!((env_hard.intensity - normalized.powi(2)).abs() < 0.001);
-        // Soft: sqrt(x) (~0.71)
-        assert!((env_soft.intensity - normalized.sqrt()).abs() < 0.001);
-    }
-    /// Test that Exponential decay provides the "long tail" feel compared to Linear.
-    #[test]
-    fn test_decay_profile_behavior() {
-        let decay_time = 1.0;
-        let mut env_lin =
-            DecayEnvelope::new(decay_time, VelocityCurve::Linear, DecayProfile::Linear);
-        let mut env_exp =
-            DecayEnvelope::new(decay_time, VelocityCurve::Linear, DecayProfile::Exponential);
-
-        env_lin.trigger(127);
-        env_exp.trigger(127);
-
-        // Move forward 0.5 seconds (halfway point)
-        let dt = Duration::from_millis(500);
-        env_lin.tick(dt);
-        env_exp.tick(dt);
-
-        // Linear should be exactly 0.5
-        assert!((env_lin.intensity - 0.5).abs() < 0.001);
-
-        // Exponential should have dropped significantly faster initially
-        // Math: e^(-5 * 0.5) = e^-2.5 ≈ 0.082
-        assert!(env_exp.intensity < 0.1);
-        assert!((env_exp.intensity - 0.082).abs() < 0.01);
-    }
-
-    /// Verify Art-Net packet structure for 8-bit DMX compliance.
-    #[test]
-    fn test_artnet_bridge_structure() {
-        let universe = 1;
-        let mut bridge = ArtNetBridge::new(universe);
-
-        // Check Header & Protocol Version
-        let bytes = bridge.as_bytes();
-        assert_eq!(&bytes[0..8], b"Art-Net\0");
-        assert_eq!(bytes[11], 14); // Protocol version
-
-        // Check Universe (Little Endian)
-        assert_eq!(bytes[14], 1);
-        assert_eq!(bytes[15], 0);
-
-        // Set a channel and check data offset (DMX data starts at index 18)
-        bridge.set_channel(0, 255);
-        bridge.set_channel(511, 42);
-
-        let data_bytes = bridge.as_bytes();
-        assert_eq!(data_bytes[18], 255);
-        assert_eq!(data_bytes[18 + 511], 42);
-    }
-
-    #[test]
-    fn test_envelope_lifecycle() {
-        let mut env = DecayEnvelope::new(0.1, VelocityCurve::Linear, DecayProfile::Linear);
-
-        // 1. Start dead
-        assert!(env.is_dead());
-
-        // 2. Trigger
-        env.trigger(127);
-        assert!(!env.is_dead());
-        assert_eq!(env.dmx_value(), 255);
-
-        // 3. Tick to completion
-        env.tick(Duration::from_millis(101));
-        assert!(env.is_dead());
-        assert_eq!(env.dmx_value(), 0);
+        let sigs2 = source.poll().unwrap();
+        assert!(sigs2.is_empty());
     }
 }

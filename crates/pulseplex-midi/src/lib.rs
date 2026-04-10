@@ -1,17 +1,29 @@
 use anyhow::{anyhow, Context, Result};
-use crossbeam_channel::{unbounded, Receiver};
+use crossbeam_channel::{unbounded, Receiver, TryRecvError};
 use midir::{MidiInput, MidiInputConnection, MidiInputPort};
+use pulseplex_core::{EventSource, Signal};
 use tracing::info;
 
-pub enum MidiSignal {
-    NoteOn { note: u8, velocity: u8 },
-    NoteOff { note: u8 },
-}
-
 pub struct MidiReceiver {
-    pub rx: Receiver<MidiSignal>,
+    rx: Receiver<Signal>,
     // Hold onto the connection so it doesn't drop and kill the bg thread
     _conn: MidiInputConnection<()>,
+}
+
+impl EventSource for MidiReceiver {
+    fn poll(&mut self) -> anyhow::Result<Vec<Signal>> {
+        let mut signals = Vec::new();
+        loop {
+            match self.rx.try_recv() {
+                Ok(signal) => signals.push(signal),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    return Err(anyhow!("MIDI background thread disconnected"));
+                }
+            }
+        }
+        Ok(signals)
+    }
 }
 
 /// Scans for available MIDI input devices and returns a list of their names.
@@ -70,10 +82,10 @@ pub fn setup_midi(target_device: &str) -> anyhow::Result<MidiReceiver> {
 
                     match status {
                         0x90 if velocity > 0 => {
-                            let _ = tx.send(MidiSignal::NoteOn { note, velocity });
+                            let _ = tx.send(Signal::Trigger { id: note, velocity });
                         }
                         0x80 | 0x90 => {
-                            let _ = tx.send(MidiSignal::NoteOff { note });
+                            let _ = tx.send(Signal::Release { id: note });
                         }
                         _ => {}
                     }
