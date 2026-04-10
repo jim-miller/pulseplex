@@ -465,3 +465,107 @@ fn handle_check(path: &str) -> anyhow::Result<()> {
     info!("Configuration check passed.");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_artnet_sink_creation() {
+        let sink = ArtNetSink::new(1, "127.0.0.1:6454");
+        assert!(sink.is_ok());
+
+        let invalid_sink = ArtNetSink::new(1, "invalid_ip");
+        assert!(invalid_sink.is_err());
+    }
+
+    #[test]
+    fn test_artnet_sink_send_state() {
+        let mut sink = ArtNetSink::new(1, "127.0.0.1:6454").unwrap();
+        let state = [42u8; 512];
+        let result = sink.send_state(&state);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_perform_shutdown_blackout() {
+        use pulseplex_core::MockSink;
+
+        let config = PulsePlexConfig {
+            shutdown: crate::config::ShutdownConfig {
+                mode: ShutdownMode::Blackout,
+                defaults: None,
+            },
+            midi: crate::config::MidiConfig {
+                device_name: "".to_string(),
+            },
+            artnet: crate::config::ArtNetConfig {
+                target_ip: "".to_string(),
+                universe: 0,
+            },
+            mapping: vec![],
+        };
+        let mut sink = MockSink::default();
+        let initial_state = [255u8; 512];
+
+        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
+        assert_eq!(sink.frames.len(), 1);
+        assert_eq!(sink.frames[0][0], 0); // Blackout frame
+    }
+
+    #[test]
+    fn test_perform_shutdown_restore() {
+        use pulseplex_core::MockSink;
+
+        let config = PulsePlexConfig {
+            shutdown: crate::config::ShutdownConfig {
+                mode: ShutdownMode::Restore,
+                defaults: None,
+            },
+            midi: crate::config::MidiConfig {
+                device_name: "".to_string(),
+            },
+            artnet: crate::config::ArtNetConfig {
+                target_ip: "".to_string(),
+                universe: 0,
+            },
+            mapping: vec![],
+        };
+        let mut sink = MockSink::default();
+        let initial_state = [128u8; 512];
+
+        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
+        assert_eq!(sink.frames.len(), 1);
+        assert_eq!(sink.frames[0][0], 128); // Restore frame
+    }
+
+    #[test]
+    fn test_perform_shutdown_default() {
+        use pulseplex_core::MockSink;
+
+        let mut defaults = HashMap::new();
+        defaults.insert(5, 42);
+
+        let config = PulsePlexConfig {
+            midi: crate::config::MidiConfig {
+                device_name: "".to_string(),
+            },
+            artnet: crate::config::ArtNetConfig {
+                target_ip: "".to_string(),
+                universe: 0,
+            },
+            mapping: vec![],
+            shutdown: crate::config::ShutdownConfig {
+                mode: ShutdownMode::Default,
+                defaults: Some(defaults),
+            },
+        };
+        let mut sink = MockSink::default();
+        let initial_state = [255u8; 512];
+
+        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
+        assert_eq!(sink.frames.len(), 1);
+        assert_eq!(sink.frames[0][0], 0); // Default channel 0 is 0
+        assert_eq!(sink.frames[0][5], 42); // Configured default
+    }
+}

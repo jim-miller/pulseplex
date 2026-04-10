@@ -321,4 +321,19 @@ mod tests {
         // Frame 3: Trigger id:2 at 64. Intensity ~0.5. Tick: 0.5 -> 0.25. DMX ~63
         assert!(sink.frames[3][1] > 60 && sink.frames[3][1] < 70);
     }
+
+    #[test]
+    fn test_mock_signals() {
+        let timeline = vec![vec![Signal::Release { id: 42 }, Signal::Clock]];
+
+        let mut source = MockSource::new(timeline);
+
+        let sigs1 = source.poll().unwrap();
+        assert_eq!(sigs1.len(), 2);
+        assert_eq!(sigs1[0], Signal::Release { id: 42 });
+        assert_eq!(sigs1[1], Signal::Clock);
+
+        let sigs2 = source.poll().unwrap();
+        assert!(sigs2.is_empty());
+    }
 }
