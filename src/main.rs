@@ -35,11 +35,14 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn new() -> io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(
+        if let Err(e) = crossterm::execute!(
             io::stdout(),
             crossterm::terminal::EnterAlternateScreen,
             crossterm::cursor::Hide
-        )?;
+        ) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            return Err(e);
+        }
         Ok(Self)
     }
 }
@@ -554,7 +557,7 @@ fn ui(f: &mut Frame, state: &DashboardState) {
     f.render_widget(signal_list, main_chunks[1]);
 
     // Footer
-    let footer = Paragraph::new(" Press Ctrl+C to Exit | Hot-reloading config active ")
+    let footer = Paragraph::new(" Press 'q' or Ctrl+C to Exit | Hot-reloading config active ")
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, chunks[2]);
 }
