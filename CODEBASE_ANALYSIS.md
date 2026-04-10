@@ -8,16 +8,16 @@
 
 ## Architecture
 
-PulsePlex uses a **Cargo workspace** structure with clear separation of concerns:
+PulsePlex uses a **Cargo workspace** structure with clear separation of concerns and protocol-agnostic boundaries:
 
 ```
 pulseplex/
 ├── Cargo.toml (workspace root)
 ├── crates/
-│   ├── pulseplex-core/      # Core domain logic (DMX, envelopes)
-│   └── pulseplex-midi/      # MIDI input handling
+│   ├── pulseplex-core/      # Core domain logic, traits, and math
+│   └── pulseplex-midi/      # MIDI input implementation
 ├── src/
-│   ├── main.rs              # CLI and daemon orchestration
+│   ├── main.rs              # CLI and orchestration loop
 │   └── config.rs            # Configuration management
 ├── pulseplex.toml           # Default configuration
 └── codebook.toml            # Spell-check dictionary
@@ -29,149 +29,65 @@ pulseplex/
 
 ### 1. pulseplex-core (`crates/pulseplex-core/src/lib.rs`)
 
-The "brain" of the system - pure, side-effect-free logic:
+The "brain" of the system - pure, side-effect-free logic and interface definitions:
 
 | Component | Purpose |
 |-----------|---------|
-| `DecayEnvelope` | Manages light intensity decay over time with configurable velocity curves (Linear, Hard, Soft) and decay profiles (Linear, Exponential) |
-| `ArtNetBridge` | Builds 530-byte Art-Net UDP packets with 512-channel DMX universe, handles sequence numbering |
-
-**Key algorithms:**
-- Velocity curves map MIDI velocity (0-127) to intensity (0.0-1.0)
-- Exponential decay: `intensity *= e^(-5 * decay_rate * dt)`
+| `Signal` | Generic enum for events (`Trigger`, `Release`, `Clock`) used to drive the engine. |
+| `EventSource` | Trait for polling generic `Signal`s from any input (MIDI, Web, OSC). |
+| `LightSink` | Trait for sending lighting states to any output (Art-Net, Hue, WebSockets). |
+| `DecayEnvelope` | Manages light intensity decay over time with configurable curves and profiles. |
+| `ArtNetBridge` | Protocol builder for 512-channel DMX universes over UDP. |
+| `MockSource`/`MockSink`| Test doubles for verifying math and timing without hardware. |
 
 ### 2. pulseplex-midi (`crates/pulseplex-midi/src/lib.rs`)
 
-MIDI input handling with producer-consumer pattern:
+Implementation of `EventSource` for MIDI hardware:
 
-| Function | Purpose |
-|----------|---------|
-| `list_midi_devices()` | Scans available MIDI input ports |
-| `find_midi_port()` | Substring matching to find target device |
-| `setup_midi()` | Creates MIDI connection with callback that sends `MidiSignal` via channel |
+- **MIDI Parsing:** Converts raw MIDI bytes (`0x90`, `0x80`) into generic `Signal::Trigger` and `Signal::Release` events.
+- **Asynchronous:** Uses a background thread and `crossbeam-channel` to ensure zero-latency MIDI capture.
 
-**MIDI parsing:**
-- `0x90` + velocity > 0 → `NoteOn`
-- `0x80` or `0x90` with velocity = 0 → `NoteOff`
+### 3. src/main.rs (Orchestration)
 
-### 3. src/config.rs
+The daemon that wires everything together:
 
-Configuration management with hot-reloading support:
-
-| Struct | Purpose |
-|--------|---------|
-| `PulsePlexConfig` | Top-level config (MIDI, Art-Net, mappings, shutdown behavior) |
-| `MappingConfig` | Note-to-DMX mapping with decay params and optional RGB color |
-| `ShutdownMode` | Blackout, Default, or Restore initial state |
-
----
-
-## Main Entry Point (`src/main.rs`)
-
-### CLI Commands
-- `pulseplex run [config]` - Start the daemon (default)
-- `pulseplex check [config]` - Validate config and check for DMX collisions
-
-### Run Daemon Path
-```
-1. Load/validate config
-2. MIDI device selection (interactive or auto)
-3. Setup file watcher for hot-reload
-4. Initialize UDP socket (broadcast)
-5. Capture initial DMX state (if Restore mode)
-6. Main Loop (40 Hz / 25ms):
-   ├─ Hot-reload config (debounced)
-   ├─ Process MIDI events
-   ├─ Update active envelopes
-   ├─ Build DMX packet
-   ├─ Send Art-Net packet
-   └─ Sleep until next frame
-7. perform_shutdown() on exit
-```
-
-### Shutdown Modes
-- `Blackout`: All lights off
-- `Default`: Set configured default values
-- `Restore`: Return to captured initial state
+- **`ArtNetSink`:** Implements `LightSink` to broadcast DMX data to the network.
+- **Hot-Reloading:** Config watcher that updates note mappings without restarting.
+- **Tick Loop:** Fixed 40Hz (25ms) orchestration loop that polls sources and updates sinks.
 
 ---
 
 ## Data Flow
 
 ```
-MIDI Hardware
+Input Hardware (MIDI)
     ↓ (midir callback)
-crossbeam_channel (MidiSignal)
-    ↓ (main thread receives)
-NoteOn/NoteOff processing
-    ↓ (creates DecayEnvelope)
-active_lights HashMap<u8, Envelope>
-    ↓ (each 25ms tick)
-DecayEnvelope::tick(dt)
-    ↓ (intensity calculated)
-DMX channel values
-    ↓ (ArtNetBridge)
-UDP Socket → Art-Net Device
+Signal Channel
+    ↓ (EventSource::poll)
+Orchestration Loop (40Hz)
+    ↓ (trigger/decay logic)
+active_lights HashMap<u8, DecayEnvelope>
+    ↓ (intensity calculation)
+DMX Frame [u8; 512]
+    ↓ (LightSink::send_state)
+Output Hardware (Art-Net)
 ```
 
 ---
 
 ## Key Design Decisions
 
-1. **Sync-to-Async Architecture**: Main loop runs synchronously at 40Hz but uses async-friendly patterns (channels, atomic flags)
+1. **Protocol Agnosticism**: Core logic only knows about `Signal`s and `[u8; 512]` frames. Hardware details are hidden behind traits.
 
-2. **Zero-Cost Abstractions**: Raw arrays for Art-Net packets, no allocations in hot path
+2. **Sync-to-Async Architecture**: Main loop runs synchronously for precise timing but communicates via lock-free channels.
 
-3. **Time-Aware Decay**: Uses `Duration` for precise timing independent of frame rate
+3. **Time-Aware Decay**: Uses `Duration` for precise timing independent of frame rate.
 
-4. **Hot Reloading**: File watcher on config with debouncing to avoid mid-save corruption
-
-5. **Real-Time Considerations**:
-   - `spin_sleep` for precise timing (avoids OS scheduler delays)
-   - Debounced config reloads
-   - Minimizing allocations in MIDI callback
-
----
-
-## Dependencies
-
-| Package | Purpose |
-|---------|---------|
-| `midir` | Cross-platform MIDI I/O |
-| `crossbeam-channel` | MPSC channels for MIDI events |
-| `tracing` | Structured logging |
-| `clap` | CLI argument parsing |
-| `serde` + `toml` | Config serialization |
-| `notify` | File system watching |
-| `dialoguer` | Interactive CLI prompts |
-| `ctrlc` | Graceful signal handling |
-| `spin_sleep` | High-precision sleep |
-
----
-
-## Configuration Example
-
-```toml
-[[mapping]]
-note = 36              # Kick drum
-dmx_channel = 0
-decay_seconds = 0.5
-velocity_curve = "hard"
-decay_profile = "exponential"
-color = [255, 0, 0]    # Red
-```
+4. **Black-Box Testing**: Integration tests run on a "virtual timeline" using `MockSource` and `MockSink`.
 
 ---
 
 ## Testing
 
-The codebase includes unit tests covering:
-- Time-aware decay accuracy
-- Velocity curve behavior (Linear, Hard, Soft)
-- Decay profiles (Linear, Exponential)
-- Envelope lifecycle
-- Art-Net protocol header structure
-- Channel mapping boundaries
-- Sequence increment
-
-All tests are in `pulseplex-core` and require no I/O dependencies.
+- **Unit Tests:** Cover decay curves, profiles, and Art-Net packet construction.
+- **Integration Tests:** `test_mock_integration` verifies the entire pipeline (Source -> Decay -> Sink) over multiple frames using mock doubles.
