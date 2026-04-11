@@ -9,9 +9,10 @@ priorities.
 
 ## Architecture & Trait Boundaries
 
-- Enforce strict separation: `pulseplex-core` must remain protocol-agnostic
-  (pure math/state).
-- Never place UDP, TCP, or MIDI I/O logic inside `pulseplex-core`.
+- Enforce strict separation: `pulseplex-core` must remain I/O-free and
+  side-effect-free (pure math/state, traits, and packet-building logic are OK).
+- Never place UDP, TCP, MIDI, or other device/network I/O logic inside
+  `pulseplex-core`.
 - All new input protocols must implement `pulseplex_core::EventSource`.
 - All new output protocols must implement `pulseplex_core::LightSink`.
 
