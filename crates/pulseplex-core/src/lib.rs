@@ -119,8 +119,8 @@ impl DecayEnvelope {
 
 /// The core stateful lighting engine.
 pub struct PulsePlexEngine {
-    pub active_lights: HashMap<u8, DecayEnvelope>,
-    pub note_mappings: HashMap<u8, MappingConfig>,
+    active_lights: HashMap<u8, DecayEnvelope>,
+    note_mappings: HashMap<u8, MappingConfig>,
 }
 
 impl PulsePlexEngine {
@@ -130,6 +130,16 @@ impl PulsePlexEngine {
             active_lights: HashMap::new(),
             note_mappings,
         }
+    }
+
+    /// Replace the current note mappings with a new set.
+    pub fn set_mappings(&mut self, mappings: Vec<MappingConfig>) {
+        self.note_mappings = mappings.into_iter().map(|m| (m.note, m)).collect();
+    }
+
+    /// Returns the number of currently active lighting envelopes.
+    pub fn active_lights_count(&self) -> usize {
+        self.active_lights.len()
     }
 
     /// Process a single tick of the orchestration loop.

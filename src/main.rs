@@ -51,7 +51,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = crossterm::execute!(
             io::stdout(),
-            crossterm::terminal::EnterAlternateScreen,
+            crossterm::terminal::LeaveAlternateScreen,
             crossterm::cursor::Show
         );
         let _ = crossterm::terminal::disable_raw_mode();
@@ -369,11 +369,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
             info!("Reloading configuration...");
             match PulsePlexConfig::load(&config_path_str) {
                 Ok(new_config) => {
-                    engine.note_mappings = new_config
-                        .mapping
-                        .into_iter()
-                        .map(|m| (m.note, m))
-                        .collect();
+                    engine.set_mappings(new_config.mapping);
                     info!("Reload successful.");
                 }
                 Err(e) => {
@@ -392,7 +388,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
             }
             // Extract DMX data from the sink's bridge for visualization
             dashboard_state.dmx_channels = *artnet_sink.bridge.dmx_data();
-            dashboard_state.active_notes = engine.active_lights.len();
+            dashboard_state.active_notes = engine.active_lights_count();
             term.draw(|f| ui(f, &dashboard_state))?;
         }
 
