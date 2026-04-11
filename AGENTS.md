@@ -58,4 +58,3 @@ principles. Always consider opportunities to improve code quality as you work.
 - `cargo clippy --all-targets -- -D warnings`: All code must pass linting rules
   before committing
 - `cargo fmt`: Format Rust code before committing
-
