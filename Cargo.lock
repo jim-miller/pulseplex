@@ -810,7 +810,7 @@ dependencies = [
 
 [[package]]
 name = "pulseplex"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -841,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "pulseplex-midi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",

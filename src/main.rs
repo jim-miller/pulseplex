@@ -392,6 +392,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
         ) {
             warn!("Engine error: {}. Initiating shutdown...", e);
             running.store(false, Ordering::SeqCst);
+            break;
         }
 
         // Update TUI state

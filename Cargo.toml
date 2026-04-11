@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 authors = ["PulsePlex <contact@pulseplex.org>"]
 edition = "2021"                                # Stick to 2021 for maximum stability
 
