@@ -20,26 +20,31 @@ pub enum DecayProfile {
     Exponential,
 }
 
-/// Note-to-DMX mapping with decay params and optional RGB color.
+/// Logical behavior for an effect (independent of input and output).
 #[derive(Debug, Clone, Deserialize)]
-pub struct MappingConfig {
-    pub note: u8,
-    pub dmx_channel: usize,
+pub struct BehaviorConfig {
     pub decay_seconds: f32,
     #[serde(default)]
     pub velocity_curve: VelocityCurve,
     #[serde(default)]
     pub decay_profile: DecayProfile,
+}
+
+/// DMX output mapping for a logical ID.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DmxOutputConfig {
+    pub internal_id: usize,
+    pub dmx_channel: usize,
     pub color: Option<[u8; 3]>,
 }
 
 /// Generic signals that can drive the lighting engine.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Signal {
-    /// A trigger event (e.g., MIDI Note On) with a payload (e.g., note number) and velocity.
-    Trigger { id: u8, velocity: u8 },
-    /// A release event (e.g., MIDI Note Off)
-    Release { id: u8 },
+    /// A trigger event with an internal high-performance ID and velocity.
+    Trigger { id: usize, velocity: u8 },
+    /// A release event
+    Release { id: usize },
     /// A clock/tick event for synchronization
     Clock,
 }
@@ -54,8 +59,6 @@ pub trait LightSink: Send {
 pub trait EventSource: Send {
     /// Poll for the next available signals, appending them to the provided buffer.
     /// This allows the caller to reuse allocations across ticks.
-    ///
-    /// NOTE: This was a breaking change in v0.2.0 (migrated from returning Owned Vec).
     fn poll(&mut self, buffer: &mut Vec<Signal>) -> anyhow::Result<()>;
 }
 
@@ -122,22 +125,21 @@ impl DecayEnvelope {
 
 /// The core stateful lighting engine.
 pub struct PulsePlexEngine {
-    active_lights: HashMap<u8, DecayEnvelope>,
-    note_mappings: HashMap<u8, MappingConfig>,
+    active_lights: HashMap<usize, DecayEnvelope>,
+    behaviors: HashMap<usize, BehaviorConfig>,
+    dmx_outputs: Vec<DmxOutputConfig>,
 }
 
 impl PulsePlexEngine {
-    pub fn new(mappings: Vec<MappingConfig>) -> Self {
-        let note_mappings = mappings.into_iter().map(|m| (m.note, m)).collect();
+    pub fn new(
+        behaviors: HashMap<usize, BehaviorConfig>,
+        dmx_outputs: Vec<DmxOutputConfig>,
+    ) -> Self {
         Self {
             active_lights: HashMap::new(),
-            note_mappings,
+            behaviors,
+            dmx_outputs,
         }
-    }
-
-    /// Replace the current note mappings with a new set.
-    pub fn set_mappings(&mut self, mappings: Vec<MappingConfig>) {
-        self.note_mappings = mappings.into_iter().map(|m| (m.note, m)).collect();
     }
 
     /// Returns the number of currently active lighting envelopes.
@@ -147,9 +149,6 @@ impl PulsePlexEngine {
 
     /// Process a single tick of the orchestration loop.
     /// Polls the source into the provided buffer, updates envelopes, builds the DMX frame, and pushes to sinks.
-    ///
-    /// NOTE: This method will .clear() the provided signal_buffer and .fill(0) the frame_buffer
-    /// before processing the current tick.
     pub fn process_tick(
         &mut self,
         dt: Duration,
@@ -163,11 +162,11 @@ impl PulsePlexEngine {
 
         for signal in signal_buffer.iter() {
             if let Signal::Trigger { id, velocity } = *signal {
-                if let Some(mapping) = self.note_mappings.get(&id) {
+                if let Some(config) = self.behaviors.get(&id) {
                     let mut env = DecayEnvelope::new(
-                        mapping.decay_seconds,
-                        mapping.velocity_curve,
-                        mapping.decay_profile,
+                        config.decay_seconds,
+                        config.velocity_curve,
+                        config.decay_profile,
                     );
                     env.trigger(velocity);
                     self.active_lights.insert(id, env);
@@ -183,24 +182,24 @@ impl PulsePlexEngine {
 
         // Build DMX frame
         frame_buffer.fill(0);
-        for (note, env) in &self.active_lights {
-            if let Some(mapping) = self.note_mappings.get(note) {
-                if let Some([r, g, b]) = mapping.color {
+        for dmx_config in &self.dmx_outputs {
+            if let Some(env) = self.active_lights.get(&dmx_config.internal_id) {
+                if let Some([r, g, b]) = dmx_config.color {
                     let r_val = (r as f32 * env.intensity) as u8;
                     let g_val = (g as f32 * env.intensity) as u8;
                     let b_val = (b as f32 * env.intensity) as u8;
 
-                    if mapping.dmx_channel < 512 {
-                        frame_buffer[mapping.dmx_channel] = r_val;
+                    if dmx_config.dmx_channel < 512 {
+                        frame_buffer[dmx_config.dmx_channel] = r_val;
                     }
-                    if mapping.dmx_channel + 1 < 512 {
-                        frame_buffer[mapping.dmx_channel + 1] = g_val;
+                    if dmx_config.dmx_channel + 1 < 512 {
+                        frame_buffer[dmx_config.dmx_channel + 1] = g_val;
                     }
-                    if mapping.dmx_channel + 2 < 512 {
-                        frame_buffer[mapping.dmx_channel + 2] = b_val;
+                    if dmx_config.dmx_channel + 2 < 512 {
+                        frame_buffer[dmx_config.dmx_channel + 2] = b_val;
                     }
-                } else if mapping.dmx_channel < 512 {
-                    frame_buffer[mapping.dmx_channel] = env.dmx_value();
+                } else if dmx_config.dmx_channel < 512 {
+                    frame_buffer[dmx_config.dmx_channel] = env.dmx_value();
                 }
             }
         }
@@ -393,24 +392,38 @@ mod tests {
         let mut signal_buffer = Vec::new();
         let mut frame_buffer = [0u8; 512];
 
-        let mut engine = PulsePlexEngine::new(vec![
-            MappingConfig {
-                note: 1,
+        let mut behaviors = HashMap::new();
+        behaviors.insert(
+            1,
+            BehaviorConfig {
+                decay_seconds: 0.1,
+                velocity_curve: VelocityCurve::Linear,
+                decay_profile: DecayProfile::Linear,
+            },
+        );
+        behaviors.insert(
+            2,
+            BehaviorConfig {
+                decay_seconds: 0.1,
+                velocity_curve: VelocityCurve::Linear,
+                decay_profile: DecayProfile::Linear,
+            },
+        );
+
+        let dmx_outputs = vec![
+            DmxOutputConfig {
+                internal_id: 1,
                 dmx_channel: 0,
-                decay_seconds: 0.1,
-                velocity_curve: VelocityCurve::Linear,
-                decay_profile: DecayProfile::Linear,
                 color: None,
             },
-            MappingConfig {
-                note: 2,
+            DmxOutputConfig {
+                internal_id: 2,
                 dmx_channel: 1,
-                decay_seconds: 0.1,
-                velocity_curve: VelocityCurve::Linear,
-                decay_profile: DecayProfile::Linear,
                 color: None,
             },
-        ]);
+        ];
+
+        let mut engine = PulsePlexEngine::new(behaviors, dmx_outputs);
         let dt = Duration::from_millis(25); // 40Hz
 
         // Run 5 frames
@@ -453,15 +466,22 @@ mod tests {
 
     #[test]
     fn test_engine_broadcast() {
-        let mappings = vec![MappingConfig {
-            note: 36,
+        let mut behaviors = HashMap::new();
+        behaviors.insert(
+            36,
+            BehaviorConfig {
+                decay_seconds: 0.1,
+                velocity_curve: VelocityCurve::Linear,
+                decay_profile: DecayProfile::Linear,
+            },
+        );
+        let dmx_outputs = vec![DmxOutputConfig {
+            internal_id: 36,
             dmx_channel: 0,
-            decay_seconds: 0.1,
-            velocity_curve: VelocityCurve::Linear,
-            decay_profile: DecayProfile::Linear,
             color: None,
         }];
-        let mut engine = PulsePlexEngine::new(mappings);
+
+        let mut engine = PulsePlexEngine::new(behaviors, dmx_outputs);
         let timeline = vec![vec![Signal::Trigger {
             id: 36,
             velocity: 127,

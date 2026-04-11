@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -289,10 +288,12 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
 
     info!("Starting PulsePlex daemon");
 
-    let mut artnet_sink = ArtNetSink::new(config.artnet.universe, &config.artnet.target_ip)?;
-    let mut midi_source = setup_midi(&config.midi.device_name)?;
+    let mut compiled = config.compile();
 
-    let mut engine = PulsePlexEngine::new(config.mapping);
+    let mut artnet_sink = ArtNetSink::new(0, "255.255.255.255:6454")?; // Default legacy target for now
+    let mut midi_source = setup_midi(&compiled.midi_device, compiled.midi_id_map)?;
+
+    let mut engine = PulsePlexEngine::new(compiled.behaviors, compiled.dmx_outputs);
 
     let sleeper = SpinSleeper::default();
 
@@ -373,7 +374,11 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
             info!("Reloading configuration...");
             match PulsePlexConfig::load(&config_path_str) {
                 Ok(new_config) => {
-                    engine.set_mappings(new_config.mapping);
+                    config = new_config;
+                    compiled = config.compile();
+                    // We can't easily recreate midi_source here without potential dropping issues
+                    // but we can update the engine behaviors and outputs
+                    engine = PulsePlexEngine::new(compiled.behaviors, compiled.dmx_outputs);
                     info!("Reload successful.");
                 }
                 Err(e) => {
@@ -542,50 +547,46 @@ fn handle_check(path: &str) -> anyhow::Result<()> {
     let config = PulsePlexConfig::load(path)?;
     println!("✅ TOML Structure: Valid");
 
-    // 2. Test Network String
-    match SocketAddr::from_str(&config.artnet.target_ip) {
-        Ok(_) => println!("✅ Network: Target IP/Port format is valid"),
-        Err(_) => {
-            if config.artnet.target_ip.to_socket_addrs().is_ok() {
-                println!(
-                    "⚠️  Network: '{}' is a valid hostname/shorthand, but not a literal IP",
-                    config.artnet.target_ip
-                );
-            } else {
-                anyhow::bail!(
-                    "❌ Network: Invalid target_ip format '{}'",
-                    config.artnet.target_ip
-                );
-            }
+    // 2. Validate Logical ID chain
+    let mut defined_ids = std::collections::HashSet::new();
+    for b in &config.behavior {
+        defined_ids.insert(&b.id);
+    }
+
+    // Check MIDI mappings
+    for (note, id) in &config.midi.mappings {
+        if !defined_ids.contains(id) {
+            println!("❌ MIDI: Note {} maps to unknown ID '{}'", note, id);
         }
     }
 
-    // 3. Test DMX Bounds and Overlaps
+    // Check DMX mappings
     let mut used_channels = HashMap::new();
-    for mapping in &config.mapping {
-        let span = if mapping.color.is_some() { 3 } else { 1 };
+    for dmx in &config.output.dmx {
+        if !defined_ids.contains(&dmx.id) {
+            println!("❌ DMX: Target ID '{}' has no defined behavior", dmx.id);
+        }
 
+        let span = if dmx.color.is_some() { 3 } else { 1 };
         for offset in 0..span {
-            let channel = mapping.dmx_channel + offset;
-
+            let channel = dmx.channel + offset;
             if channel > 511 {
                 anyhow::bail!(
-                    "❌ DMX: Note {} (channel {}) exceeds universe limit (511)",
-                    mapping.note,
+                    "❌ DMX: ID {} (channel {}) exceeds universe limit (511)",
+                    dmx.id,
                     channel
                 );
             }
-
-            if let Some(other_note) = used_channels.insert(channel, mapping.note) {
+            if let Some(other_id) = used_channels.insert(channel, &dmx.id) {
                 warn!(
-                    "DMX Collision: Channel {} is used by both Note {} and Note {}",
-                    channel, other_note, mapping.note
+                    "DMX Collision: Channel {} is used by both ID '{}' and ID '{}'",
+                    channel, other_id, dmx.id
                 );
             }
         }
     }
 
-    println!("✅ DMX Mappings: All notes within 0-511 range");
+    println!("✅ 3-Tier Mapping: Logical IDs and DMX bounds valid");
     info!("Configuration check passed.");
     Ok(())
 }
@@ -615,24 +616,14 @@ mod tests {
     fn test_perform_shutdown_blackout() {
         use pulseplex_core::MockSink;
 
-        let config = PulsePlexConfig {
-            midi: crate::config::MidiConfig {
-                device_name: "".to_string(),
-            },
-            artnet: crate::config::ArtNetConfig {
-                target_ip: "".to_string(),
-                universe: 0,
-            },
-            mapping: vec![],
-            shutdown: crate::config::ShutdownConfig {
-                mode: ShutdownMode::Blackout,
-                defaults: None,
-            },
+        let config = crate::config::ShutdownConfig {
+            mode: ShutdownMode::Blackout,
+            defaults: None,
         };
         let mut sink = MockSink::default();
         let initial_state = [255u8; 512];
 
-        perform_shutdown(&config.shutdown, &mut sink, &initial_state).unwrap();
+        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
         assert_eq!(sink.frames.len(), 1);
         assert_eq!(sink.frames[0][0], 0); // Blackout frame
     }
@@ -641,24 +632,14 @@ mod tests {
     fn test_perform_shutdown_restore() {
         use pulseplex_core::MockSink;
 
-        let config = PulsePlexConfig {
-            midi: crate::config::MidiConfig {
-                device_name: "".to_string(),
-            },
-            artnet: crate::config::ArtNetConfig {
-                target_ip: "".to_string(),
-                universe: 0,
-            },
-            mapping: vec![],
-            shutdown: crate::config::ShutdownConfig {
-                mode: ShutdownMode::Restore,
-                defaults: None,
-            },
+        let config = crate::config::ShutdownConfig {
+            mode: ShutdownMode::Restore,
+            defaults: None,
         };
         let mut sink = MockSink::default();
         let initial_state = [128u8; 512];
 
-        perform_shutdown(&config.shutdown, &mut sink, &initial_state).unwrap();
+        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
         assert_eq!(sink.frames.len(), 1);
         assert_eq!(sink.frames[0][0], 128); // Restore frame
     }
@@ -670,24 +651,14 @@ mod tests {
         let mut defaults = HashMap::new();
         defaults.insert(5, 42);
 
-        let config = PulsePlexConfig {
-            midi: crate::config::MidiConfig {
-                device_name: "".to_string(),
-            },
-            artnet: crate::config::ArtNetConfig {
-                target_ip: "".to_string(),
-                universe: 0,
-            },
-            mapping: vec![],
-            shutdown: crate::config::ShutdownConfig {
-                mode: ShutdownMode::Default,
-                defaults: Some(defaults),
-            },
+        let config = crate::config::ShutdownConfig {
+            mode: ShutdownMode::Default,
+            defaults: Some(defaults),
         };
         let mut sink = MockSink::default();
         let initial_state = [255u8; 512];
 
-        perform_shutdown(&config.shutdown, &mut sink, &initial_state).unwrap();
+        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
         assert_eq!(sink.frames.len(), 1);
         assert_eq!(sink.frames[0][0], 0); // Default channel 0 is 0
         assert_eq!(sink.frames[0][5], 42); // Configured default

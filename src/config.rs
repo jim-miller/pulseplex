@@ -3,27 +3,44 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use anyhow::Result;
-use pulseplex_core::MappingConfig;
+use pulseplex_core::{BehaviorConfig, DmxOutputConfig};
 use serde::Deserialize;
 use toml_edit::{value, DocumentMut};
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct PulsePlexConfig {
     pub midi: MidiConfig,
-    pub artnet: ArtNetConfig,
-    pub mapping: Vec<MappingConfig>,
+    pub behavior: Vec<BehaviorDefinition>,
+    pub output: OutputConfig,
     pub shutdown: ShutdownConfig,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct MidiConfig {
     pub device_name: String,
+    pub mappings: HashMap<u8, String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
-pub struct ArtNetConfig {
-    pub target_ip: String,
-    pub universe: u16,
+pub struct BehaviorDefinition {
+    pub id: String,
+    pub decay_seconds: f32,
+    #[serde(default)]
+    pub velocity_curve: pulseplex_core::VelocityCurve,
+    #[serde(default)]
+    pub decay_profile: pulseplex_core::DecayProfile,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct OutputConfig {
+    pub dmx: Vec<DmxOutputDefinition>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct DmxOutputDefinition {
+    pub id: String,
+    pub channel: usize,
+    pub color: Option<[u8; 3]>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -39,6 +56,13 @@ pub struct ShutdownConfig {
     pub defaults: Option<HashMap<usize, u8>>,
 }
 
+pub struct CompiledConfig {
+    pub midi_device: String,
+    pub midi_id_map: HashMap<u8, usize>,
+    pub behaviors: HashMap<usize, BehaviorConfig>,
+    pub dmx_outputs: Vec<DmxOutputConfig>,
+}
+
 impl PulsePlexConfig {
     pub fn load(path: &str) -> Result<Self> {
         let contents = fs::read_to_string(path)
@@ -46,6 +70,52 @@ impl PulsePlexConfig {
         let config: PulsePlexConfig = toml::from_str(&contents)
             .map_err(|e| anyhow::anyhow!("Failed to parse TOML: {}", e))?;
         Ok(config)
+    }
+
+    pub fn compile(&self) -> CompiledConfig {
+        let mut id_map: HashMap<String, usize> = HashMap::new();
+        let mut next_id = 0;
+
+        let mut get_id = |name: &str| -> usize {
+            *id_map.entry(name.to_string()).or_insert_with(|| {
+                let id = next_id;
+                next_id += 1;
+                id
+            })
+        };
+
+        let mut midi_id_map = HashMap::new();
+        for (note, logical_id) in &self.midi.mappings {
+            midi_id_map.insert(*note, get_id(logical_id));
+        }
+
+        let mut behaviors = HashMap::new();
+        for b in &self.behavior {
+            behaviors.insert(
+                get_id(&b.id),
+                BehaviorConfig {
+                    decay_seconds: b.decay_seconds,
+                    velocity_curve: b.velocity_curve,
+                    decay_profile: b.decay_profile,
+                },
+            );
+        }
+
+        let mut dmx_outputs = Vec::new();
+        for d in &self.output.dmx {
+            dmx_outputs.push(DmxOutputConfig {
+                internal_id: get_id(&d.id),
+                dmx_channel: d.channel,
+                color: d.color,
+            });
+        }
+
+        CompiledConfig {
+            midi_device: self.midi.device_name.clone(),
+            midi_id_map,
+            behaviors,
+            dmx_outputs,
+        }
     }
 }
 
