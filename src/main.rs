@@ -744,16 +744,34 @@ fn perform_shutdown(
         ShutdownMode::Default => {
             info!("Shutting down: Applying default scene");
             if let Some(defaults) = &config.defaults {
-                // Map the default DMX channels back to intensities using internal IDs
-                for (&ch, &val) in defaults {
-                    // Find which internal ID maps to this DMX channel
-                    if let Some(m) = compiled.dmx_outputs.iter().find(|m| m.dmx_channel == ch) {
+                for m in &compiled.dmx_outputs {
+                    let mut max_intensity: f32 = 0.0;
+
+                    if let Some(base_color) = m.color {
+                        // For RGB, check all 3 channels and derive max intensity relative to base color
+                        for (offset, &base_val) in base_color.iter().enumerate() {
+                            if base_val > 0 {
+                                if let Some(&default_val) = defaults.get(&(m.dmx_channel + offset))
+                                {
+                                    let intensity = default_val as f32 / base_val as f32;
+                                    max_intensity = max_intensity.max(intensity);
+                                }
+                            }
+                        }
+                    } else {
+                        // For grayscale, just check the single channel
+                        if let Some(&default_val) = defaults.get(&m.dmx_channel) {
+                            max_intensity = default_val as f32 / 255.0;
+                        }
+                    }
+
+                    if max_intensity > 0.0 {
                         let mut env = pulseplex_core::DecayEnvelope::new(
                             1.0,
                             Default::default(),
                             Default::default(),
                         );
-                        env.intensity = val as f32 / 255.0;
+                        env.intensity = max_intensity.min(1.0);
                         shutdown_intensities.insert(m.internal_id, env);
                     }
                 }
@@ -761,17 +779,30 @@ fn perform_shutdown(
         }
         ShutdownMode::Restore => {
             info!("Shutting down: Restoring previous state");
-            for (ch, &val) in initial_state.iter().enumerate() {
-                if val > 0 {
-                    if let Some(m) = compiled.dmx_outputs.iter().find(|m| m.dmx_channel == ch) {
-                        let mut env = pulseplex_core::DecayEnvelope::new(
-                            1.0,
-                            Default::default(),
-                            Default::default(),
-                        );
-                        env.intensity = val as f32 / 255.0;
-                        shutdown_intensities.insert(m.internal_id, env);
+            for m in &compiled.dmx_outputs {
+                let mut max_intensity: f32 = 0.0;
+
+                if let Some(base_color) = m.color {
+                    for (offset, &base_val) in base_color.iter().enumerate() {
+                        if base_val > 0 {
+                            if let Some(&captured_val) = initial_state.get(m.dmx_channel + offset) {
+                                let intensity = captured_val as f32 / base_val as f32;
+                                max_intensity = max_intensity.max(intensity);
+                            }
+                        }
                     }
+                } else if let Some(&captured_val) = initial_state.get(m.dmx_channel) {
+                    max_intensity = captured_val as f32 / 255.0;
+                }
+
+                if max_intensity > 0.0 {
+                    let mut env = pulseplex_core::DecayEnvelope::new(
+                        1.0,
+                        Default::default(),
+                        Default::default(),
+                    );
+                    env.intensity = max_intensity.min(1.0);
+                    shutdown_intensities.insert(m.internal_id, env);
                 }
             }
         }
@@ -1024,7 +1055,7 @@ mod tests {
             DmxOutputCompiled {
                 internal_id: 101,
                 dmx_channel: 10,
-                color: None,
+                color: Some([200, 0, 0]),
             },
         ];
 
@@ -1044,7 +1075,7 @@ mod tests {
         let mut sink = MockSink::default();
         let mut initial_state = [0u8; 512];
         initial_state[0] = 255;
-        initial_state[10] = 128;
+        initial_state[10] = 100; // 100 relative to base 200 = 0.5 intensity
 
         perform_shutdown(&config, &mut sink, &initial_state, &compiled).unwrap();
 
@@ -1069,13 +1100,13 @@ mod tests {
             DmxOutputCompiled {
                 internal_id: 201,
                 dmx_channel: 10,
-                color: None,
+                color: Some([0, 255, 0]),
             },
         ];
 
         let mut defaults = HashMap::new();
         defaults.insert(5, 255);
-        defaults.insert(10, 128);
+        defaults.insert(11, 128); // Green channel (+1) relative to base 255 = ~0.5 intensity
 
         let config = crate::config::ShutdownConfig {
             mode: ShutdownMode::Default,
@@ -1098,7 +1129,7 @@ mod tests {
         assert_eq!(sink.states.len(), 1);
         // Channel 5 maps to ID 200
         assert!((*sink.states[0].get(&200).unwrap() - 1.0).abs() < 0.01);
-        // Channel 10 maps to ID 201
-        assert!((*sink.states[0].get(&201).unwrap() - 0.5).abs() < 0.01);
+        // Channel 11 maps to Green of ID 201
+        assert!((*sink.states[0].get(&201).unwrap() - 0.50).abs() < 0.01);
     }
 }
