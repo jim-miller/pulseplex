@@ -30,6 +30,7 @@ impl HueSink {
         bridge_ip: String,
         username: String,
         client_key: String,
+        area_id: String,
         mappings: Vec<HueOutputMapping>,
     ) -> Result<Self> {
         // Capacity 1: we only care about the latest frame.
@@ -37,17 +38,30 @@ impl HueSink {
         let (tx, rx) = bounded(1);
 
         let background_mappings = mappings.clone();
+
+        // Construct runtime before spawning to surface errors
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to create tokio runtime for Hue background thread: {}",
+                    e
+                )
+            })?;
+
         // Spawn background thread for DTLS streaming
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime for Hue background thread");
-
             rt.block_on(async {
-                if let Err(e) =
-                    run_hue_background(bridge_ip, username, client_key, background_mappings, rx)
-                        .await
+                if let Err(e) = run_hue_background(
+                    bridge_ip,
+                    username,
+                    client_key,
+                    area_id,
+                    background_mappings,
+                    rx,
+                )
+                .await
                 {
                     error!("Hue background thread failed: {}", e);
                 }
@@ -80,6 +94,7 @@ async fn run_hue_background(
     bridge_ip: String,
     username: String,
     client_key: String,
+    _area_id: String, // Note: area_id is usually used in the HTTPS setup, streaming is bridge-wide/PSK bound
     mappings: Vec<HueOutputMapping>,
     rx: Receiver<Vec<f32>>,
 ) -> Result<()> {

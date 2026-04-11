@@ -377,18 +377,27 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
 
     // Initialize all configured sinks into a broadcast group
     let mut main_sink = BroadcastSink::new();
-    let mut artnet_sink_ptr: Option<*mut ArtNetSink> = None;
+
+    // Stable owner for Art-Net sink to avoid UB with pointers
+    let mut dashboard_artnet_sink: Option<ArtNetSink> = None;
 
     for target in &compiled.targets {
         match target {
             TargetConfig::ArtNet(artnet) => {
-                let mut sink = Box::new(ArtNetSink::new(
+                let sink = ArtNetSink::new(
                     artnet.universe,
                     &artnet.target_ip,
                     compiled.dmx_outputs.clone(),
-                )?);
-                artnet_sink_ptr = Some(&mut *sink as *mut ArtNetSink);
-                main_sink.add(sink);
+                )?;
+                // First Art-Net target becomes the dashboard source
+                if dashboard_artnet_sink.is_none() {
+                    dashboard_artnet_sink = Some(ArtNetSink::new(
+                        artnet.universe,
+                        &artnet.target_ip,
+                        compiled.dmx_outputs.clone(),
+                    )?);
+                }
+                main_sink.add(Box::new(sink));
                 info!("Initialized Art-Net sink for universe {}", artnet.universe);
             }
             TargetConfig::Hue(hue) => {
@@ -405,6 +414,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                     hue.bridge_ip.clone(),
                     hue.username.clone(),
                     hue.client_key.clone(),
+                    hue.area_id.clone(),
                     hue_mappings,
                 )?;
                 main_sink.add(Box::new(sink));
@@ -511,7 +521,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
 
                                     // Re-initialize sinks
                                     let mut new_main_sink = BroadcastSink::new();
-                                    let mut new_artnet_sink_ptr: Option<*mut ArtNetSink> = None;
+                                    let mut new_dashboard_sink: Option<ArtNetSink> = None;
 
                                     for target in &applied_compiled.targets {
                                         match target {
@@ -522,11 +532,14 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                                                     applied_compiled.dmx_outputs.clone(),
                                                 ) {
                                                     Ok(sink) => {
-                                                        let mut sink_box = Box::new(sink);
-                                                        new_artnet_sink_ptr = Some(
-                                                            &mut *sink_box as *mut ArtNetSink,
-                                                        );
-                                                        new_main_sink.add(sink_box);
+                                                        if new_dashboard_sink.is_none() {
+                                                            new_dashboard_sink = Some(ArtNetSink::new(
+                                                                artnet.universe,
+                                                                &artnet.target_ip,
+                                                                applied_compiled.dmx_outputs.clone(),
+                                                            )?);
+                                                        }
+                                                        new_main_sink.add(Box::new(sink));
                                                     }
                                                     Err(e) => {
                                                         warn!(
@@ -552,6 +565,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                                                     hue.bridge_ip.clone(),
                                                     hue.username.clone(),
                                                     hue.client_key.clone(),
+                                                    hue.area_id.clone(),
                                                     hue_mappings,
                                                 ) {
                                                     Ok(sink) => new_main_sink.add(Box::new(sink)),
@@ -565,7 +579,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                                     }
                                     if !new_main_sink.is_empty() {
                                         main_sink = new_main_sink;
-                                        artnet_sink_ptr = new_artnet_sink_ptr;
+                                        dashboard_artnet_sink = new_dashboard_sink;
                                     } else {
                                         warn!("Hot reload failed to initialize any targets. Keeping old targets.");
                                         applied_compiled.targets = compiled.targets.clone();
@@ -612,11 +626,9 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
             }
 
             // We still want to see DMX in the dashboard if possible.
-            // If we have an Art-Net sink, we can use its build_frame helper.
-            if let Some(ptr) = artnet_sink_ptr {
-                unsafe {
-                    dashboard_state.dmx_channels = (*ptr).build_frame(engine.active_lights());
-                }
+            // If we have an Art-Net sink, we use its build_frame helper safely.
+            if let Some(ref sink) = dashboard_artnet_sink {
+                dashboard_state.dmx_channels = sink.build_frame(engine.active_lights());
             } else {
                 dashboard_state.dmx_channels.fill(0);
             }
@@ -724,15 +736,53 @@ fn ui(f: &mut Frame, state: &DashboardState) {
 }
 
 fn perform_shutdown(
-    _config: &crate::config::ShutdownConfig,
+    config: &crate::config::ShutdownConfig,
     sink: &mut dyn LightSink,
-    _initial_state: &[u8; 512],
+    initial_state: &[u8; 512],
 ) -> anyhow::Result<()> {
-    // Shutdown currently assumes a DMX frame for simplicity in the trait.
-    // In a multi-protocol world, we might need a more generic shutdown state.
-    // For now, we'll just pass a zeroed intensity map to the sink.
-    let empty_intensities = HashMap::new();
-    sink.send_state(&empty_intensities)?;
+    let mut shutdown_intensities = HashMap::new();
+
+    match config.mode {
+        ShutdownMode::Blackout => {
+            info!("Shutting down: Blackout");
+            // intensities is already empty -> blackout
+        }
+        ShutdownMode::Default => {
+            info!("Shutting down: Applying default scene");
+            // For Default mode, we need to map the DMX defaults back to intensities.
+            // However, the LightSink trait now takes intensities.
+            // Simplified: we'll define a special "shutdown" envelope for active IDs.
+            // For now, let's just use the logic from PR 17 but translate to intensities.
+            if let Some(defaults) = &config.defaults {
+                for (&ch, &val) in defaults {
+                    // Create dummy envelopes for shutdown channels
+                    let mut env = pulseplex_core::DecayEnvelope::new(
+                        1.0,
+                        Default::default(),
+                        Default::default(),
+                    );
+                    env.intensity = val as f32 / 255.0;
+                    shutdown_intensities.insert(ch, env);
+                }
+            }
+        }
+        ShutdownMode::Restore => {
+            info!("Shutting down: Restoring previous state");
+            for (ch, &val) in initial_state.iter().enumerate() {
+                if val > 0 {
+                    let mut env = pulseplex_core::DecayEnvelope::new(
+                        1.0,
+                        Default::default(),
+                        Default::default(),
+                    );
+                    env.intensity = val as f32 / 255.0;
+                    shutdown_intensities.insert(ch, env);
+                }
+            }
+        }
+    }
+
+    sink.send_state(&shutdown_intensities)?;
     Ok(())
 }
 
