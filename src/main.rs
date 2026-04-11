@@ -292,7 +292,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
     let mut artnet_sink = ArtNetSink::new(config.artnet.universe, &config.artnet.target_ip)?;
     let mut midi_source = setup_midi(&config.midi.device_name)?;
 
-    let mut engine = PulsePlexEngine::new(config.mapping.clone());
+    let mut engine = PulsePlexEngine::new(config.mapping);
 
     let sleeper = SpinSleeper::default();
 
@@ -383,13 +383,16 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
         }
 
         // Output and processing - Reusing buffers
-        engine.process_tick(
+        if let Err(e) = engine.process_tick(
             delta_time,
             &mut midi_source,
             &mut [&mut artnet_sink],
             &mut signal_buffer,
             &mut frame_buffer,
-        )?;
+        ) {
+            warn!("Engine error: {}. Initiating shutdown...", e);
+            running.store(false, Ordering::SeqCst);
+        }
 
         // Update TUI state
         if let Some(ref mut term) = terminal {
@@ -416,7 +419,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
         next_deadline = Instant::now().max(next_deadline) + target_interval;
     }
 
-    perform_shutdown(&config, &mut artnet_sink, &initial_state)?;
+    perform_shutdown(&config.shutdown, &mut artnet_sink, &initial_state)?;
 
     info!("PulsePlex shut down cleanly.");
     Ok(())
@@ -499,20 +502,20 @@ fn ui(f: &mut Frame, state: &DashboardState) {
 }
 
 fn perform_shutdown(
-    config: &PulsePlexConfig,
+    config: &crate::config::ShutdownConfig,
     sink: &mut dyn LightSink,
     initial_state: &[u8; 512],
 ) -> anyhow::Result<()> {
     let mut final_frame = [0u8; 512];
 
-    match config.shutdown.mode {
+    match config.mode {
         ShutdownMode::Blackout => {
             info!("Shutting down: Blackout");
             // final_frame is already all zeros
         }
         ShutdownMode::Default => {
             info!("Shutting down: Applying default scene");
-            if let Some(defaults) = &config.shutdown.defaults {
+            if let Some(defaults) = &config.defaults {
                 for (ch, val) in defaults {
                     if *ch < 512 {
                         final_frame[*ch] = *val;
@@ -628,7 +631,7 @@ mod tests {
         let mut sink = MockSink::default();
         let initial_state = [255u8; 512];
 
-        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
+        perform_shutdown(&config.shutdown, &mut sink, &initial_state).unwrap();
         assert_eq!(sink.frames.len(), 1);
         assert_eq!(sink.frames[0][0], 0); // Blackout frame
     }
@@ -654,7 +657,7 @@ mod tests {
         let mut sink = MockSink::default();
         let initial_state = [128u8; 512];
 
-        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
+        perform_shutdown(&config.shutdown, &mut sink, &initial_state).unwrap();
         assert_eq!(sink.frames.len(), 1);
         assert_eq!(sink.frames[0][0], 128); // Restore frame
     }
@@ -683,7 +686,7 @@ mod tests {
         let mut sink = MockSink::default();
         let initial_state = [255u8; 512];
 
-        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
+        perform_shutdown(&config.shutdown, &mut sink, &initial_state).unwrap();
         assert_eq!(sink.frames.len(), 1);
         assert_eq!(sink.frames[0][0], 0); // Default channel 0 is 0
         assert_eq!(sink.frames[0][5], 42); // Configured default

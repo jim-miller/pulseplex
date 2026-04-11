@@ -54,6 +54,8 @@ pub trait LightSink: Send {
 pub trait EventSource: Send {
     /// Poll for the next available signals, appending them to the provided buffer.
     /// This allows the caller to reuse allocations across ticks.
+    ///
+    /// NOTE: This was a breaking change in v0.2.0 (migrated from returning Owned Vec).
     fn poll(&mut self, buffer: &mut Vec<Signal>) -> anyhow::Result<()>;
 }
 
@@ -145,6 +147,9 @@ impl PulsePlexEngine {
 
     /// Process a single tick of the orchestration loop.
     /// Polls the source into the provided buffer, updates envelopes, builds the DMX frame, and pushes to sinks.
+    ///
+    /// NOTE: This method will .clear() the provided signal_buffer and .fill(0) the frame_buffer
+    /// before processing the current tick.
     pub fn process_tick(
         &mut self,
         dt: Duration,
