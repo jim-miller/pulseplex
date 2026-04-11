@@ -43,7 +43,7 @@ test-watch:
 
 # Build the release binary for local macOS testing
 build-mac:
-    cargo build --release --target aarch64-apple-darwin
+    cargo build --release
 
 # Build the release binary for Raspberry Pi (Linux ARM64)
 build-pi:
