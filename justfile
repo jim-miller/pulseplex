@@ -51,8 +51,8 @@ build-arm:
 
 # Build and deploy directly to a remote server/device
 
-# Usage: just deploy-pi user@192.168.1.x
-deploy-remote TARGET: build-pi
+# Usage: just deploy-remote user@192.168.1.x
+deploy-remote TARGET: build-arm
     @echo "Deploying to {{ TARGET }}..."
     scp target/aarch64-unknown-linux-gnu/release/pulseplex {{ TARGET }}:/tmp/pulseplex
     ssh {{ TARGET }} "sudo mv /tmp/pulseplex /usr/local/bin/pulseplex && sudo chmod +x /usr/local/bin/pulseplex"
