@@ -380,17 +380,22 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                             // Update MIDI source with new ID map
                             match setup_midi(&new_compiled.midi_device, new_compiled.midi_id_map.clone()) {
                                 Ok(new_midi_source) => {
-                                    midi_source = new_midi_source;
-                                    engine = PulsePlexEngine::new(new_compiled.behaviors.clone(), new_compiled.dmx_outputs.clone());
+                                    let mut applied_compiled = new_compiled;
                                     // Update Art-Net sink if network config changed
-                                    if new_compiled.artnet.target_ip != compiled.artnet.target_ip || new_compiled.artnet.universe != compiled.artnet.universe {
-                                        match ArtNetSink::new(new_compiled.artnet.universe, &new_compiled.artnet.target_ip) {
+                                    if applied_compiled.artnet.target_ip != compiled.artnet.target_ip || applied_compiled.artnet.universe != compiled.artnet.universe {
+                                        let previous_artnet = compiled.artnet.clone();
+                                        match ArtNetSink::new(applied_compiled.artnet.universe, &applied_compiled.artnet.target_ip) {
                                             Ok(new_sink) => artnet_sink = new_sink,
-                                            Err(e) => warn!("Could not update Art-Net sink: {}. Using old connection.", e),
+                                            Err(e) => {
+                                                warn!("Could not update Art-Net sink: {}. Using old connection.", e);
+                                                applied_compiled.artnet = previous_artnet;
+                                            }
                                         }
                                     }
+                                    midi_source = new_midi_source;
+                                    engine = PulsePlexEngine::new(applied_compiled.behaviors.clone(), applied_compiled.dmx_outputs.clone());
                                     config = new_config;
-                                    compiled = new_compiled;
+                                    compiled = applied_compiled;
                                     info!("Reload successful.");
                                 }
                                 Err(e) => warn!("Reload failed: could not recreate MIDI source: {}. Keeping previous configuration.", e),
