@@ -12,6 +12,8 @@ pub struct PulsePlexConfig {
     pub midi: MidiConfig,
     pub behavior: Vec<BehaviorDefinition>,
     pub output: OutputConfig,
+    #[serde(default)]
+    pub targets: Vec<TargetConfig>,
     pub shutdown: ShutdownConfig,
 }
 
@@ -33,8 +35,19 @@ pub struct BehaviorDefinition {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct OutputConfig {
-    pub artnet: ArtNetConfig,
+    pub artnet: Option<ArtNetConfig>,
     pub dmx: Vec<DmxOutputDefinition>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum TargetConfig {
+    ArtNet(ArtNetConfig),
+    #[allow(dead_code)]
+    Hue {
+        bridge_ip: String,
+        app_key: String,
+    },
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -69,15 +82,21 @@ pub struct CompiledConfig {
     pub midi_id_map: HashMap<u8, usize>,
     pub behaviors: HashMap<usize, BehaviorConfig>,
     pub dmx_outputs: Vec<DmxOutputConfig>,
-    pub artnet: ArtNetConfig,
+    pub targets: Vec<TargetConfig>,
 }
 
 impl PulsePlexConfig {
     pub fn load(path: &str) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("Failed to read config file {}: {}", path, e))?;
-        let config: PulsePlexConfig = toml::from_str(&contents)
+        let mut config: PulsePlexConfig = toml::from_str(&contents)
             .map_err(|e| anyhow::anyhow!("Failed to parse TOML: {}", e))?;
+
+        // Migration: Move legacy artnet config to targets
+        if let Some(artnet) = config.output.artnet.take() {
+            config.targets.push(TargetConfig::ArtNet(artnet));
+        }
+
         Ok(config)
     }
 
@@ -108,7 +127,12 @@ impl PulsePlexConfig {
         // 2. Map behaviors and validate uniqueness
         let mut behaviors = HashMap::new();
         for b in &self.behavior {
-            let internal_id = *id_map.get(&b.id).unwrap();
+            let internal_id = *id_map.get(&b.id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Behavior ID '{}' was not assigned an internal ID during config compilation",
+                    b.id
+                )
+            })?;
             if behaviors
                 .insert(
                     internal_id,
@@ -164,7 +188,7 @@ impl PulsePlexConfig {
             midi_id_map,
             behaviors,
             dmx_outputs,
-            artnet: self.output.artnet.clone(),
+            targets: self.targets.clone(),
         })
     }
 }

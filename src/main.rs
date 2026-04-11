@@ -29,6 +29,8 @@ use spin_sleep::SpinSleeper;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+use crate::config::TargetConfig;
+
 /// RAII Guard to ensure terminal state is restored on drop.
 struct TerminalGuard;
 
@@ -128,6 +130,35 @@ impl LightSink for ArtNetSink {
         self.bridge.set_raw_data(state);
         self.socket.send_to(self.bridge.as_bytes(), self.addr)?;
         self.bridge.increment_sequence();
+        Ok(())
+    }
+}
+
+/// A sink that broadcasts frames to multiple underlying sinks.
+#[derive(Default)]
+pub struct BroadcastSink {
+    sinks: Vec<Box<dyn LightSink>>,
+}
+
+impl BroadcastSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, sink: Box<dyn LightSink>) {
+        self.sinks.push(sink);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sinks.is_empty()
+    }
+}
+
+impl LightSink for BroadcastSink {
+    fn send_state(&mut self, state: &[u8; 512]) -> anyhow::Result<()> {
+        for sink in &mut self.sinks {
+            sink.send_state(state)?;
+        }
         Ok(())
     }
 }
@@ -291,7 +322,28 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
 
     let mut compiled = config.compile()?;
 
-    let mut artnet_sink = ArtNetSink::new(compiled.artnet.universe, &compiled.artnet.target_ip)?;
+    // Initialize all configured sinks into a broadcast group
+    let mut main_sink = BroadcastSink::new();
+    for target in &compiled.targets {
+        match target {
+            TargetConfig::ArtNet(artnet) => {
+                let sink = ArtNetSink::new(artnet.universe, &artnet.target_ip)?;
+                main_sink.add(Box::new(sink));
+                info!("Initialized Art-Net sink for universe {}", artnet.universe);
+            }
+            TargetConfig::Hue { bridge_ip, .. } => {
+                warn!(
+                    "Philips Hue support is planned but not yet implemented (Bridge: {})",
+                    bridge_ip
+                );
+            }
+        }
+    }
+
+    if main_sink.is_empty() {
+        bail!("No valid lighting targets configured.");
+    }
+
     let mut midi_source = setup_midi(&compiled.midi_device, compiled.midi_id_map.clone())?;
 
     let mut engine = PulsePlexEngine::new(compiled.behaviors.clone(), compiled.dmx_outputs.clone());
@@ -381,19 +433,31 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                             match setup_midi(&new_compiled.midi_device, new_compiled.midi_id_map.clone()) {
                                 Ok(new_midi_source) => {
                                     let mut applied_compiled = new_compiled;
-                                    // Update Art-Net sink if network config changed
-                                    if applied_compiled.artnet.target_ip != compiled.artnet.target_ip || applied_compiled.artnet.universe != compiled.artnet.universe {
-                                        let previous_artnet = compiled.artnet.clone();
-                                        match ArtNetSink::new(applied_compiled.artnet.universe, &applied_compiled.artnet.target_ip) {
-                                            Ok(new_sink) => artnet_sink = new_sink,
-                                            Err(e) => {
-                                                warn!("Could not update Art-Net sink: {}. Using old connection.", e);
-                                                applied_compiled.artnet = previous_artnet;
+
+                                    // Re-initialize sinks
+                                    let mut new_main_sink = BroadcastSink::new();
+                                    for target in &applied_compiled.targets {
+                                        match target {
+                                            TargetConfig::ArtNet(artnet) => {
+                                                if let Ok(sink) = ArtNetSink::new(artnet.universe, &artnet.target_ip) {
+                                                    new_main_sink.add(Box::new(sink));
+                                                }
                                             }
+                                            TargetConfig::Hue { .. } => {}
                                         }
                                     }
+                                    if !new_main_sink.is_empty() {
+                                        main_sink = new_main_sink;
+                                    } else {
+                                        warn!("Hot reload failed to initialize any targets. Keeping old targets.");
+                                        applied_compiled.targets = compiled.targets.clone();
+                                    }
+
                                     midi_source = new_midi_source;
-                                    engine = PulsePlexEngine::new(applied_compiled.behaviors.clone(), applied_compiled.dmx_outputs.clone());
+                                    engine = PulsePlexEngine::new(
+                                        applied_compiled.behaviors.clone(),
+                                        applied_compiled.dmx_outputs.clone(),
+                                    );
                                     config = new_config;
                                     compiled = applied_compiled;
                                     info!("Reload successful.");
@@ -417,7 +481,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
         if let Err(e) = engine.process_tick(
             delta_time,
             &mut midi_source,
-            &mut [&mut artnet_sink],
+            &mut [&mut main_sink],
             &mut signal_buffer,
             &mut frame_buffer,
         ) {
@@ -451,7 +515,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
         next_deadline = Instant::now().max(next_deadline) + target_interval;
     }
 
-    perform_shutdown(&config.shutdown, &mut artnet_sink, &initial_state)?;
+    let _ = perform_shutdown(&config.shutdown, &mut main_sink, &initial_state);
 
     info!("PulsePlex shut down cleanly.");
     Ok(())
@@ -584,21 +648,31 @@ fn handle_check(path: &str) -> anyhow::Result<()> {
         }
     }
 
-    // 3. Test Art-Net Network String
-    match SocketAddr::from_str(&config.output.artnet.target_ip) {
-        Ok(_) => println!("✅ Network: Target IP/Port format is valid"),
-        Err(_) => {
-            if config.output.artnet.target_ip.to_socket_addrs().is_ok() {
+    // 3. Test Network Strings for all targets
+    for target in &config.targets {
+        match target {
+            TargetConfig::ArtNet(artnet) => match SocketAddr::from_str(&artnet.target_ip) {
+                Ok(_) => println!("✅ Network (Art-Net): Target IP/Port format is valid"),
+                Err(_) => {
+                    if artnet.target_ip.to_socket_addrs().is_ok() {
+                        println!(
+                            "⚠️  Network: '{}' is a valid hostname/shorthand, but not a literal IP",
+                            artnet.target_ip
+                        );
+                    } else {
+                        println!(
+                            "❌ Network: Invalid target_ip format '{}'",
+                            artnet.target_ip
+                        );
+                        bail!("Configuration check failed.");
+                    }
+                }
+            },
+            TargetConfig::Hue { bridge_ip, .. } => {
                 println!(
-                    "⚠️  Network: '{}' is a valid hostname/shorthand, but not a literal IP",
-                    config.output.artnet.target_ip
+                    "⚠️  Network (Hue): Philips Hue check is not yet implemented (Bridge: {})",
+                    bridge_ip
                 );
-            } else {
-                println!(
-                    "❌ Network: Invalid target_ip format '{}'",
-                    config.output.artnet.target_ip
-                );
-                bail!("Configuration check failed.");
             }
         }
     }
