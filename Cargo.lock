@@ -1553,7 +1553,6 @@ dependencies = [
  "crossbeam-channel",
  "hex",
  "pulseplex-core",
- "serde",
  "tokio",
  "tracing",
  "webrtc-dtls",

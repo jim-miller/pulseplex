@@ -8,7 +8,6 @@ authors.workspace = true
 pulseplex-core = { workspace = true }
 anyhow = { workspace = true }
 crossbeam-channel = { workspace = true }
-serde = { workspace = true }
 tracing = { workspace = true }
 tokio = { version = "1.43.0", features = ["full"] }
 webrtc-dtls = "0.10.0"

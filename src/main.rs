@@ -643,7 +643,8 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
         next_deadline = Instant::now().max(next_deadline) + target_interval;
     }
 
-    if let Err(err) = perform_shutdown(&config.shutdown, &mut main_sink, &initial_state) {
+    if let Err(err) = perform_shutdown(&config.shutdown, &mut main_sink, &initial_state, &compiled)
+    {
         warn!("Failed to perform shutdown lighting action: {err}");
     }
 
@@ -731,6 +732,7 @@ fn perform_shutdown(
     config: &crate::config::ShutdownConfig,
     sink: &mut dyn LightSink,
     initial_state: &[u8; 512],
+    compiled: &crate::config::CompiledConfig,
 ) -> anyhow::Result<()> {
     let mut shutdown_intensities = HashMap::new();
 
@@ -741,17 +743,19 @@ fn perform_shutdown(
         }
         ShutdownMode::Default => {
             info!("Shutting down: Applying default scene");
-            // For Default mode, we map the DMX defaults back to intensities.
             if let Some(defaults) = &config.defaults {
+                // Map the default DMX channels back to intensities using internal IDs
                 for (&ch, &val) in defaults {
-                    // Create dummy envelopes for shutdown channels
-                    let mut env = pulseplex_core::DecayEnvelope::new(
-                        1.0,
-                        Default::default(),
-                        Default::default(),
-                    );
-                    env.intensity = val as f32 / 255.0;
-                    shutdown_intensities.insert(ch, env);
+                    // Find which internal ID maps to this DMX channel
+                    if let Some(m) = compiled.dmx_outputs.iter().find(|m| m.dmx_channel == ch) {
+                        let mut env = pulseplex_core::DecayEnvelope::new(
+                            1.0,
+                            Default::default(),
+                            Default::default(),
+                        );
+                        env.intensity = val as f32 / 255.0;
+                        shutdown_intensities.insert(m.internal_id, env);
+                    }
                 }
             }
         }
@@ -759,13 +763,15 @@ fn perform_shutdown(
             info!("Shutting down: Restoring previous state");
             for (ch, &val) in initial_state.iter().enumerate() {
                 if val > 0 {
-                    let mut env = pulseplex_core::DecayEnvelope::new(
-                        1.0,
-                        Default::default(),
-                        Default::default(),
-                    );
-                    env.intensity = val as f32 / 255.0;
-                    shutdown_intensities.insert(ch, env);
+                    if let Some(m) = compiled.dmx_outputs.iter().find(|m| m.dmx_channel == ch) {
+                        let mut env = pulseplex_core::DecayEnvelope::new(
+                            1.0,
+                            Default::default(),
+                            Default::default(),
+                        );
+                        env.intensity = val as f32 / 255.0;
+                        shutdown_intensities.insert(m.internal_id, env);
+                    }
                 }
             }
         }
@@ -1006,27 +1012,66 @@ mod tests {
 
     #[test]
     fn test_perform_shutdown_restore() {
+        use crate::config::{CompiledConfig, DmxOutputCompiled};
         use pulseplex_core::MockSink;
+
+        let dmx_outputs = vec![
+            DmxOutputCompiled {
+                internal_id: 100,
+                dmx_channel: 0,
+                color: None,
+            },
+            DmxOutputCompiled {
+                internal_id: 101,
+                dmx_channel: 10,
+                color: None,
+            },
+        ];
 
         let config = crate::config::ShutdownConfig {
             mode: ShutdownMode::Restore,
             defaults: None,
         };
+        let compiled = CompiledConfig {
+            midi_device: "".to_string(),
+            midi_id_map: HashMap::new(),
+            behaviors: HashMap::new(),
+            dmx_outputs,
+            hue_outputs: vec![],
+            targets: vec![],
+        };
+
         let mut sink = MockSink::default();
         let mut initial_state = [0u8; 512];
         initial_state[0] = 255;
         initial_state[10] = 128;
 
-        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
+        perform_shutdown(&config, &mut sink, &initial_state, &compiled).unwrap();
 
         assert_eq!(sink.states.len(), 1);
-        assert!((*sink.states[0].get(&0).unwrap() - 1.0).abs() < 0.01);
-        assert!((*sink.states[0].get(&10).unwrap() - 0.5).abs() < 0.01);
+        // Channel 0 maps to ID 100
+        assert!((*sink.states[0].get(&100).unwrap() - 1.0).abs() < 0.01);
+        // Channel 10 maps to ID 101
+        assert!((*sink.states[0].get(&101).unwrap() - 0.5).abs() < 0.01);
     }
 
     #[test]
     fn test_perform_shutdown_default() {
+        use crate::config::{CompiledConfig, DmxOutputCompiled};
         use pulseplex_core::MockSink;
+
+        let dmx_outputs = vec![
+            DmxOutputCompiled {
+                internal_id: 200,
+                dmx_channel: 5,
+                color: None,
+            },
+            DmxOutputCompiled {
+                internal_id: 201,
+                dmx_channel: 10,
+                color: None,
+            },
+        ];
 
         let mut defaults = HashMap::new();
         defaults.insert(5, 255);
@@ -1036,13 +1081,24 @@ mod tests {
             mode: ShutdownMode::Default,
             defaults: Some(defaults),
         };
+        let compiled = CompiledConfig {
+            midi_device: "".to_string(),
+            midi_id_map: HashMap::new(),
+            behaviors: HashMap::new(),
+            dmx_outputs,
+            hue_outputs: vec![],
+            targets: vec![],
+        };
+
         let mut sink = MockSink::default();
         let initial_state = [0u8; 512];
 
-        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
+        perform_shutdown(&config, &mut sink, &initial_state, &compiled).unwrap();
 
         assert_eq!(sink.states.len(), 1);
-        assert!((*sink.states[0].get(&5).unwrap() - 1.0).abs() < 0.01);
-        assert!((*sink.states[0].get(&10).unwrap() - 0.5).abs() < 0.01);
+        // Channel 5 maps to ID 200
+        assert!((*sink.states[0].get(&200).unwrap() - 1.0).abs() < 0.01);
+        // Channel 10 maps to ID 201
+        assert!((*sink.states[0].get(&201).unwrap() - 0.5).abs() < 0.01);
     }
 }
