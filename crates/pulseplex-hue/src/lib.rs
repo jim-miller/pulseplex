@@ -150,10 +150,12 @@ async fn stream_to_hue(
     let mut sequence: u8 = 0;
 
     loop {
-        // Wait for next frame from the hot loop
-        let intensities = match rx.recv() {
-            Ok(i) => i,
-            Err(_) => return Ok(()), // Channel closed, shutdown thread
+        // Wait for next frame from the hot loop without blocking the Tokio executor.
+        let rx_clone = rx.clone();
+        let intensities = match tokio::task::spawn_blocking(move || rx_clone.recv()).await {
+            Ok(Ok(i)) => i,
+            Ok(Err(_)) => return Ok(()), // Channel closed, shutdown thread
+            Err(e) => return Err(anyhow!("Hue receive task failed: {}", e)),
         };
 
         let buf = build_huestream_packet(&intensities, mappings, sequence)?;
@@ -183,18 +185,26 @@ pub fn build_huestream_packet(
     buf.push(0x00); // Color Space RGB
     buf.push(0x00); // Reserved
 
+    let scale_rgb_channel = |channel: u8, intensity: f32| -> u16 {
+        ((channel as f32 * 257.0) * intensity)
+            .clamp(0.0, 65535.0)
+            .round() as u16
+    };
+    let scale_intensity =
+        |intensity: f32| -> u16 { (intensity * 65535.0).clamp(0.0, 65535.0).round() as u16 };
+
     // Lights
     for (idx, m) in mappings.iter().enumerate() {
         let intensity = intensities.get(idx).cloned().unwrap_or(0.0);
 
         let (r, g, b) = if let Some([rc, gc, bc]) = m.color {
             (
-                (rc as f32 * intensity) as u16 * 257,
-                (gc as f32 * intensity) as u16 * 257,
-                (bc as f32 * intensity) as u16 * 257,
+                scale_rgb_channel(rc, intensity),
+                scale_rgb_channel(gc, intensity),
+                scale_rgb_channel(bc, intensity),
             )
         } else {
-            let val = (intensity * 65535.0) as u16;
+            let val = scale_intensity(intensity);
             (val, val, val)
         };
 
@@ -250,11 +260,11 @@ mod tests {
         // Light 2 (Grayscale)
         // Offset 16 + 9 = 25
         // ID 11 -> 0x000B
-        // Value 0.5 * 65535 = 32767 -> 0x7FFF
+        // Value 0.5 * 65535 = 32767.5 -> round to 32768 (0x8000)
         assert_eq!(packet[25], 0x00);
         assert_eq!(packet[26], 0x00);
         assert_eq!(packet[27], 0x0B);
-        assert_eq!(packet[28], 0x7F);
-        assert_eq!(packet[29], 0xFF);
+        assert_eq!(packet[28], 0x80);
+        assert_eq!(packet[29], 0x00);
     }
 }
