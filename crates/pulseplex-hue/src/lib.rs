@@ -12,11 +12,11 @@ use tracing::{error, info, warn};
 use webrtc_dtls::config::Config;
 use webrtc_dtls::conn::DTLSConn;
 
-/// Compiled mapping for a single Hue light.
+/// Compiled mapping for a single Hue light channel in an Entertainment Area.
 #[derive(Clone, Debug)]
 pub struct HueOutputMapping {
     pub internal_id: usize,
-    pub light_id: u16,
+    pub channel_id: u8,
     pub color: Option<[u8; 3]>,
 }
 
@@ -34,6 +34,11 @@ impl HueSink {
         area_id: String,
         mappings: Vec<HueOutputMapping>,
     ) -> Result<Self> {
+        // Validation: area_id must be a UUID (36 chars)
+        if area_id.len() != 36 {
+            return Err(anyhow!("Hue area_id must be exactly 36 characters (UUID)"));
+        }
+
         // Capacity 1: we only care about the latest frame.
         let (tx, rx) = bounded(1);
         let rx_drain = rx.clone();
@@ -88,11 +93,10 @@ impl LightSink for HueSink {
             buffer.push(intensity);
         }
 
-        // "Latest-wins" strategy: If the buffer is full, drop the stale frame and try again.
+        // "Latest-wins" strategy
         match self.tx.try_send(buffer) {
             Ok(_) => {}
             Err(TrySendError::Full(latest)) => {
-                // Drain the stale frame and replace it with the latest state.
                 let _ = self.rx_drain.try_recv();
                 let _ = self.tx.try_send(latest);
             }
@@ -108,7 +112,7 @@ async fn run_hue_background(
     bridge_ip: String,
     username: String,
     client_key: String,
-    _area_id: String, // reserved for future use
+    area_id: String,
     mappings: Vec<HueOutputMapping>,
     rx: Receiver<Vec<f32>>,
 ) -> Result<()> {
@@ -126,16 +130,12 @@ async fn run_hue_background(
     };
 
     loop {
-        // Exit if the hot loop has dropped the sender.
         match rx.try_recv() {
             Err(TryRecvError::Disconnected) => {
                 info!("Hue sender disconnected; exiting background task.");
                 return Ok(());
             }
             Ok(i) => {
-                // We accidentally drained a frame while checking for disconnection.
-                // This is unlikely to happen at the start of the loop, but we should handle it.
-                // Re-connect and then stream.
                 info!(
                     "Connecting to Hue bridge at {} via DTLS (after pre-emptive drain)...",
                     addr
@@ -151,10 +151,9 @@ async fn run_hue_background(
                             continue;
                         }
                     };
-                // Fall into streaming logic with the frame we just popped.
-                // Simplified: we'll just continue and wait for next frame in stream_to_hue.
-                // But since we already have 'i', let's start streaming.
-                if let Err(e) = stream_to_hue_starting_with(dtls_conn, &mappings, &rx, i).await {
+                if let Err(e) =
+                    stream_to_hue_starting_with(dtls_conn, &mappings, &rx, i, &area_id).await
+                {
                     warn!("Hue streaming error: {}. Reconnecting...", e);
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
@@ -180,7 +179,7 @@ async fn run_hue_background(
 
         info!("Hue DTLS connection established.");
 
-        match stream_to_hue(dtls_conn, &mappings, &rx).await {
+        match stream_to_hue(dtls_conn, &mappings, &rx, &area_id).await {
             Ok(_) => {
                 info!("Hue background thread shutting down cleanly.");
                 return Ok(());
@@ -197,6 +196,7 @@ async fn stream_to_hue(
     conn: DTLSConn,
     mappings: &[HueOutputMapping],
     rx: &Receiver<Vec<f32>>,
+    area_id: &str,
 ) -> Result<()> {
     let rx_clone = rx.clone();
     let intensities = match tokio::task::spawn_blocking(move || rx_clone.recv()).await {
@@ -204,7 +204,7 @@ async fn stream_to_hue(
         Ok(Err(_)) => return Ok(()),
         Err(e) => return Err(anyhow!("Hue receive task failed: {}", e)),
     };
-    stream_to_hue_starting_with(conn, mappings, rx, intensities).await
+    stream_to_hue_starting_with(conn, mappings, rx, intensities, area_id).await
 }
 
 async fn stream_to_hue_starting_with(
@@ -212,12 +212,13 @@ async fn stream_to_hue_starting_with(
     mappings: &[HueOutputMapping],
     rx: &Receiver<Vec<f32>>,
     first_intensities: Vec<f32>,
+    area_id: &str,
 ) -> Result<()> {
     let mut sequence: u8 = 0;
     let mut current_intensities = first_intensities;
 
     loop {
-        let buf = build_huestream_packet(&current_intensities, mappings, sequence)?;
+        let buf = build_huestream_packet(&current_intensities, mappings, sequence, area_id)?;
         sequence = sequence.wrapping_add(1);
 
         if let Err(e) = conn.write(&buf, None).await {
@@ -234,20 +235,36 @@ async fn stream_to_hue_starting_with(
     }
 }
 
+/// Corrected HueStream binary packet builder per official Hue Entertainment API spec.
 pub fn build_huestream_packet(
     intensities: &[f32],
     mappings: &[HueOutputMapping],
     sequence: u8,
+    area_id: &str,
 ) -> Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(16 + mappings.len() * 9);
+    // 16 byte header + 36 byte UUID + (7 bytes * channels)
+    let mut buf = Vec::with_capacity(16 + 36 + (mappings.len() * 7));
 
+    // 1. Protocol Name (9 bytes)
     buf.extend_from_slice(b"HueStream");
-    buf.push(0x01); // Version Major
-    buf.push(0x00); // Version Minor
-    buf.push(sequence);
-    buf.extend_from_slice(&[0x00, 0x00]);
-    buf.push(0x00); // Color Space RGB
+    // 2. Version 2.0 (2 bytes)
+    buf.push(0x02);
     buf.push(0x00);
+    // 3. Sequence ID (1 byte)
+    buf.push(sequence);
+    // 4. Reserved (2 bytes)
+    buf.extend_from_slice(&[0x00, 0x00]);
+    // 5. Color Space RGB (1 byte)
+    buf.push(0x00);
+    // 6. Reserved (1 byte)
+    buf.push(0x00);
+
+    // 7. Entertainment Configuration ID (36 bytes)
+    let area_bytes = area_id.as_bytes();
+    if area_bytes.len() != 36 {
+        return Err(anyhow!("Hue area_id must be exactly 36 characters (UUID)"));
+    }
+    buf.extend_from_slice(area_bytes);
 
     let scale_rgb_channel = |channel: u8, intensity: f32| -> u16 {
         ((channel as f32 * 257.0) * intensity)
@@ -257,6 +274,7 @@ pub fn build_huestream_packet(
     let scale_intensity =
         |intensity: f32| -> u16 { (intensity * 65535.0).clamp(0.0, 65535.0).round() as u16 };
 
+    // 8. Data Slots (7 bytes per channel)
     for (idx, m) in mappings.iter().enumerate() {
         let intensity = intensities.get(idx).cloned().unwrap_or(0.0);
 
@@ -271,8 +289,9 @@ pub fn build_huestream_packet(
             (val, val, val)
         };
 
-        buf.push(0x00);
-        buf.write_u16::<BigEndian>(m.light_id)?;
+        // Channel ID (1 byte)
+        buf.push(m.channel_id);
+        // RGB Data (6 bytes, Big Endian)
         buf.write_u16::<BigEndian>(r)?;
         buf.write_u16::<BigEndian>(g)?;
         buf.write_u16::<BigEndian>(b)?;
@@ -286,37 +305,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_huestream_packet_layout() {
+    fn test_huestream_packet_layout_v2() {
         let mappings = vec![
             HueOutputMapping {
                 internal_id: 1,
-                light_id: 10,
+                channel_id: 0,
                 color: Some([255, 128, 0]),
             },
             HueOutputMapping {
                 internal_id: 2,
-                light_id: 11,
+                channel_id: 1,
                 color: None,
             },
         ];
 
         let intensities = vec![1.0, 0.5];
         let sequence = 42;
+        let area_id = "12345678-1234-1234-1234-123456789012";
 
-        let packet = build_huestream_packet(&intensities, &mappings, sequence).unwrap();
+        let packet = build_huestream_packet(&intensities, &mappings, sequence, area_id).unwrap();
 
+        // Header
         assert_eq!(&packet[0..9], b"HueStream");
+        assert_eq!(packet[9], 0x02); // Version Major
         assert_eq!(packet[11], sequence);
 
-        // Light 1 (RGB)
-        assert_eq!(packet[17], 0x00);
-        assert_eq!(packet[18], 0x0A);
-        assert_eq!(packet[19], 0xFF);
-        assert_eq!(packet[20], 0xFF);
+        // Area ID
+        assert_eq!(&packet[16..52], area_id.as_bytes());
 
-        // Light 2 (Grayscale)
-        assert_eq!(packet[27], 0x0B);
-        assert_eq!(packet[28], 0x80);
-        assert_eq!(packet[29], 0x00);
+        // Channel 0 (RGB)
+        // Offset 52: Channel ID (0x00)
+        // Offset 53-54: R (65535 -> 0xFFFF)
+        assert_eq!(packet[52], 0x00);
+        assert_eq!(packet[53], 0xFF);
+        assert_eq!(packet[54], 0xFF);
+
+        // Channel 1 (Grayscale)
+        // Offset 52 + 7 = 59
+        // Offset 59: Channel ID (0x01)
+        assert_eq!(packet[59], 0x01);
+        assert_eq!(packet[60], 0x80); // 0.5 * 65535 rounded
     }
 }

@@ -51,7 +51,7 @@ pub struct DmxOutputDefinition {
 #[derive(Deserialize, Debug, Clone)]
 pub struct HueOutputDefinition {
     pub id: String,
-    pub light_id: u16,
+    pub channel_id: u8,
     pub color: Option<[u8; 3]>,
 }
 
@@ -110,7 +110,7 @@ pub struct DmxOutputCompiled {
 #[derive(Clone, Debug)]
 pub struct HueOutputCompiled {
     pub internal_id: usize,
-    pub light_id: u16,
+    pub channel_id: u8,
     pub color: Option<[u8; 3]>,
 }
 
@@ -231,7 +231,7 @@ impl PulsePlexConfig {
 
             hue_outputs.push(HueOutputCompiled {
                 internal_id,
-                light_id: h.light_id,
+                channel_id: h.channel_id,
                 color: h.color,
             });
         }

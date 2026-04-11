@@ -410,7 +410,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                     .iter()
                     .map(|h| HueOutputMapping {
                         internal_id: h.internal_id,
-                        light_id: h.light_id,
+                        channel_id: h.channel_id,
                         color: h.color,
                     })
                     .collect();
@@ -553,7 +553,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                                                     .iter()
                                                     .map(|h| HueOutputMapping {
                                                         internal_id: h.internal_id,
-                                                        light_id: h.light_id,
+                                                        channel_id: h.channel_id,
                                                         color: h.color,
                                                     })
                                                     .collect();
