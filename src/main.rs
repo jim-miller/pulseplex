@@ -338,6 +338,9 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
     let mut last_tick = Instant::now();
     let mut next_deadline = last_tick + target_interval;
 
+    // Reused buffer for the hot loop
+    let mut signal_buffer = Vec::with_capacity(64);
+
     while running.load(Ordering::SeqCst) {
         let now = Instant::now();
         let delta_time = now.duration_since(last_tick);
@@ -378,13 +381,18 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
             }
         }
 
-        // Output and processing
-        let signals = engine.process_tick(delta_time, &mut midi_source, &mut [&mut artnet_sink])?;
+        // Output and processing - Reusing signal_buffer
+        engine.process_tick(
+            delta_time,
+            &mut midi_source,
+            &mut [&mut artnet_sink],
+            &mut signal_buffer,
+        )?;
 
         // Update TUI state
         if let Some(ref mut term) = terminal {
-            for signal in signals {
-                dashboard_state.push_signal(signal);
+            for signal in &signal_buffer {
+                dashboard_state.push_signal(*signal);
             }
             // Extract DMX data from the sink's bridge for visualization
             dashboard_state.dmx_channels = *artnet_sink.bridge.dmx_data();

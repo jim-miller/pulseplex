@@ -11,18 +11,17 @@ pub struct MidiReceiver {
 }
 
 impl EventSource for MidiReceiver {
-    fn poll(&mut self) -> anyhow::Result<Vec<Signal>> {
-        let mut signals = Vec::new();
+    fn poll(&mut self, buffer: &mut Vec<Signal>) -> anyhow::Result<()> {
         loop {
             match self.rx.try_recv() {
-                Ok(signal) => signals.push(signal),
+                Ok(signal) => buffer.push(signal),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     return Err(anyhow!("MIDI background thread disconnected"));
                 }
             }
         }
-        Ok(signals)
+        Ok(())
     }
 }
 

@@ -52,8 +52,9 @@ pub trait LightSink: Send {
 
 /// Interface for receiving signals from hardware or protocols.
 pub trait EventSource: Send {
-    /// Poll for the next available signals. Non-blocking.
-    fn poll(&mut self) -> anyhow::Result<Vec<Signal>>;
+    /// Poll for the next available signals, appending them to the provided buffer.
+    /// This allows the caller to reuse allocations across ticks.
+    fn poll(&mut self, buffer: &mut Vec<Signal>) -> anyhow::Result<()>;
 }
 
 pub struct DecayEnvelope {
@@ -143,17 +144,18 @@ impl PulsePlexEngine {
     }
 
     /// Process a single tick of the orchestration loop.
-    /// Polls the source, updates envelopes, builds the DMX frame, and pushes to sinks.
-    /// Returns the signals processed during this tick for UI/logging.
+    /// Polls the source into the provided buffer, updates envelopes, and pushes to sinks.
     pub fn process_tick(
         &mut self,
         dt: Duration,
         source: &mut dyn EventSource,
         sinks: &mut [&mut dyn LightSink],
-    ) -> anyhow::Result<Vec<Signal>> {
-        let signals = source.poll()?;
+        buffer: &mut Vec<Signal>,
+    ) -> anyhow::Result<()> {
+        buffer.clear();
+        source.poll(buffer)?;
 
-        for signal in &signals {
+        for signal in buffer.iter() {
             if let Signal::Trigger { id, velocity } = *signal {
                 if let Some(mapping) = self.note_mappings.get(&id) {
                     let mut env = DecayEnvelope::new(
@@ -202,7 +204,7 @@ impl PulsePlexEngine {
             sink.send_state(&frame)?;
         }
 
-        Ok(signals)
+        Ok(())
     }
 }
 
@@ -305,8 +307,11 @@ impl MockSource {
 }
 
 impl EventSource for MockSource {
-    fn poll(&mut self) -> anyhow::Result<Vec<Signal>> {
-        Ok(self.queue.pop().unwrap_or_default())
+    fn poll(&mut self, buffer: &mut Vec<Signal>) -> anyhow::Result<()> {
+        if let Some(mut signals) = self.queue.pop() {
+            buffer.append(&mut signals);
+        }
+        Ok(())
     }
 }
 
@@ -379,42 +384,33 @@ mod tests {
 
         let mut source = MockSource::new(timeline);
         let mut sink = MockSink::default();
+        let mut buffer = Vec::new();
 
-        let mut active_lights: std::collections::HashMap<u8, DecayEnvelope> =
-            std::collections::HashMap::new();
+        let mut engine = PulsePlexEngine::new(vec![
+            MappingConfig {
+                note: 1,
+                dmx_channel: 0,
+                decay_seconds: 0.1,
+                velocity_curve: VelocityCurve::Linear,
+                decay_profile: DecayProfile::Linear,
+                color: None,
+            },
+            MappingConfig {
+                note: 2,
+                dmx_channel: 1,
+                decay_seconds: 0.1,
+                velocity_curve: VelocityCurve::Linear,
+                decay_profile: DecayProfile::Linear,
+                color: None,
+            },
+        ]);
         let dt = Duration::from_millis(25); // 40Hz
 
         // Run 5 frames
         for _ in 0..5 {
-            // 1. Poll
-            let signals = source.poll().unwrap();
-            for s in signals {
-                if let Signal::Trigger { id, velocity } = s {
-                    let mut env =
-                        DecayEnvelope::new(0.1, VelocityCurve::Linear, DecayProfile::Linear);
-                    env.trigger(velocity);
-                    active_lights.insert(id, env);
-                }
-            }
-
-            // 2. Tick
-            active_lights.retain(|_, env| {
-                env.tick(dt);
-                !env.is_dead()
-            });
-
-            // 3. Build Frame
-            let mut frame = [0u8; 512];
-            for (id, env) in &active_lights {
-                if *id == 1 {
-                    frame[0] = env.dmx_value();
-                } else if *id == 2 {
-                    frame[1] = env.dmx_value();
-                }
-            }
-
-            // 4. Sink
-            sink.send_state(&frame).unwrap();
+            engine
+                .process_tick(dt, &mut source, &mut [&mut sink], &mut buffer)
+                .unwrap();
         }
 
         // Frame 0: Trigger id:1 at 127. Intensity 1.0 -> 0.75 after tick. DMX ~191
@@ -430,14 +426,16 @@ mod tests {
         let timeline = vec![vec![Signal::Release { id: 42 }, Signal::Clock]];
 
         let mut source = MockSource::new(timeline);
+        let mut buffer = Vec::new();
 
-        let sigs1 = source.poll().unwrap();
-        assert_eq!(sigs1.len(), 2);
-        assert_eq!(sigs1[0], Signal::Release { id: 42 });
-        assert_eq!(sigs1[1], Signal::Clock);
+        source.poll(&mut buffer).unwrap();
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(buffer[0], Signal::Release { id: 42 });
+        assert_eq!(buffer[1], Signal::Clock);
 
-        let sigs2 = source.poll().unwrap();
-        assert!(sigs2.is_empty());
+        buffer.clear();
+        source.poll(&mut buffer).unwrap();
+        assert!(buffer.is_empty());
     }
 
     #[test]
@@ -456,6 +454,7 @@ mod tests {
             velocity: 127,
         }]];
         let mut source = MockSource::new(timeline);
+        let mut buffer = Vec::new();
 
         let mut sink1 = MockSink::default();
         let mut sink2 = MockSink::default();
@@ -465,6 +464,7 @@ mod tests {
                 Duration::from_millis(25),
                 &mut source,
                 &mut [&mut sink1, &mut sink2],
+                &mut buffer,
             )
             .unwrap();
 
