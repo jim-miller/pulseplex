@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -17,6 +18,19 @@ pub enum DecayProfile {
     #[default]
     Linear,
     Exponential,
+}
+
+/// Note-to-DMX mapping with decay params and optional RGB color.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MappingConfig {
+    pub note: u8,
+    pub dmx_channel: usize,
+    pub decay_seconds: f32,
+    #[serde(default)]
+    pub velocity_curve: VelocityCurve,
+    #[serde(default)]
+    pub decay_profile: DecayProfile,
+    pub color: Option<[u8; 3]>,
 }
 
 /// Generic signals that can drive the lighting engine.
@@ -100,6 +114,85 @@ impl DecayEnvelope {
 
     pub fn dmx_value(&self) -> u8 {
         (self.intensity * 255.0) as u8
+    }
+}
+
+/// The core stateful lighting engine.
+pub struct PulsePlexEngine {
+    pub active_lights: HashMap<u8, DecayEnvelope>,
+    pub note_mappings: HashMap<u8, MappingConfig>,
+}
+
+impl PulsePlexEngine {
+    pub fn new(mappings: Vec<MappingConfig>) -> Self {
+        let note_mappings = mappings.into_iter().map(|m| (m.note, m)).collect();
+        Self {
+            active_lights: HashMap::new(),
+            note_mappings,
+        }
+    }
+
+    /// Process a single tick of the orchestration loop.
+    /// Polls the source, updates envelopes, builds the DMX frame, and pushes to sinks.
+    /// Returns the signals processed during this tick for UI/logging.
+    pub fn process_tick(
+        &mut self,
+        dt: Duration,
+        source: &mut dyn EventSource,
+        sinks: &mut [&mut dyn LightSink],
+    ) -> anyhow::Result<Vec<Signal>> {
+        let signals = source.poll()?;
+
+        for signal in &signals {
+            if let Signal::Trigger { id, velocity } = *signal {
+                if let Some(mapping) = self.note_mappings.get(&id) {
+                    let mut env = DecayEnvelope::new(
+                        mapping.decay_seconds,
+                        mapping.velocity_curve,
+                        mapping.decay_profile,
+                    );
+                    env.trigger(velocity);
+                    self.active_lights.insert(id, env);
+                }
+            }
+        }
+
+        // Update envelopes
+        self.active_lights.retain(|_, env| {
+            env.tick(dt);
+            !env.is_dead()
+        });
+
+        // Build DMX frame
+        let mut frame = [0u8; 512];
+        for (note, env) in &self.active_lights {
+            if let Some(mapping) = self.note_mappings.get(note) {
+                if let Some([r, g, b]) = mapping.color {
+                    let r_val = (r as f32 * env.intensity) as u8;
+                    let g_val = (g as f32 * env.intensity) as u8;
+                    let b_val = (b as f32 * env.intensity) as u8;
+
+                    if mapping.dmx_channel < 512 {
+                        frame[mapping.dmx_channel] = r_val;
+                    }
+                    if mapping.dmx_channel + 1 < 512 {
+                        frame[mapping.dmx_channel + 1] = g_val;
+                    }
+                    if mapping.dmx_channel + 2 < 512 {
+                        frame[mapping.dmx_channel + 2] = b_val;
+                    }
+                } else if mapping.dmx_channel < 512 {
+                    frame[mapping.dmx_channel] = env.dmx_value();
+                }
+            }
+        }
+
+        // Push to all sinks
+        for sink in sinks {
+            sink.send_state(&frame)?;
+        }
+
+        Ok(signals)
     }
 }
 
@@ -335,5 +428,39 @@ mod tests {
 
         let sigs2 = source.poll().unwrap();
         assert!(sigs2.is_empty());
+    }
+
+    #[test]
+    fn test_engine_broadcast() {
+        let mappings = vec![MappingConfig {
+            note: 36,
+            dmx_channel: 0,
+            decay_seconds: 0.1,
+            velocity_curve: VelocityCurve::Linear,
+            decay_profile: DecayProfile::Linear,
+            color: None,
+        }];
+        let mut engine = PulsePlexEngine::new(mappings);
+        let timeline = vec![vec![Signal::Trigger {
+            id: 36,
+            velocity: 127,
+        }]];
+        let mut source = MockSource::new(timeline);
+
+        let mut sink1 = MockSink::default();
+        let mut sink2 = MockSink::default();
+
+        engine
+            .process_tick(
+                Duration::from_millis(25),
+                &mut source,
+                &mut [&mut sink1, &mut sink2],
+            )
+            .unwrap();
+
+        assert_eq!(sink1.frames.len(), 1);
+        assert_eq!(sink2.frames.len(), 1);
+        assert_eq!(sink1.frames[0][0], sink2.frames[0][0]);
+        assert!(sink1.frames[0][0] > 0);
     }
 }

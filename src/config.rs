@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use anyhow::Result;
-use pulseplex_core::{DecayProfile, VelocityCurve};
+use pulseplex_core::MappingConfig;
 use serde::Deserialize;
 use toml_edit::{value, DocumentMut};
 
@@ -24,18 +24,6 @@ pub struct MidiConfig {
 pub struct ArtNetConfig {
     pub target_ip: String,
     pub universe: u16,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-pub struct MappingConfig {
-    pub note: u8,
-    pub dmx_channel: usize,
-    pub decay_seconds: f32,
-    #[serde(default)]
-    pub velocity_curve: VelocityCurve,
-    #[serde(default)]
-    pub decay_profile: DecayProfile,
-    pub color: Option<[u8; 3]>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

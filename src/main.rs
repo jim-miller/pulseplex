@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pulseplex_core::{ArtNetBridge, DecayEnvelope, EventSource, LightSink, Signal};
+use pulseplex_core::{ArtNetBridge, LightSink, PulsePlexEngine, Signal};
 use pulseplex_midi::setup_midi;
 
 use anyhow::bail;
@@ -26,7 +26,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use spin_sleep::SpinSleeper;
-use tracing::{debug, info, trace, warn};
+use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// RAII Guard to ensure terminal state is restored on drop.
@@ -51,16 +51,14 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = crossterm::execute!(
             io::stdout(),
-            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::terminal::EnterAlternateScreen,
             crossterm::cursor::Show
         );
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
 
-use crate::config::{
-    get_config_path, update_midi_device_in_config, MappingConfig, PulsePlexConfig, ShutdownMode,
-};
+use crate::config::{get_config_path, update_midi_device_in_config, PulsePlexConfig, ShutdownMode};
 
 #[derive(Parser)]
 #[command(
@@ -278,12 +276,6 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
         watcher.watch(parent, notify::RecursiveMode::NonRecursive)?;
         info!("Watching for config changes in: {:?}", parent);
     }
-    let mut note_mappings: HashMap<u8, MappingConfig> = config
-        .clone()
-        .mapping
-        .into_iter()
-        .map(|m| (m.note, m))
-        .collect();
 
     let target_hz = 40.0; // 25ms
     let target_interval = Duration::from_secs_f64(1.0 / target_hz);
@@ -300,8 +292,9 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
     let mut artnet_sink = ArtNetSink::new(config.artnet.universe, &config.artnet.target_ip)?;
     let mut midi_source = setup_midi(&config.midi.device_name)?;
 
+    let mut engine = PulsePlexEngine::new(config.mapping.clone());
+
     let sleeper = SpinSleeper::default();
-    let mut active_lights: HashMap<u8, DecayEnvelope> = HashMap::new();
 
     let mut initial_state = [0u8; 512];
     if matches!(config.shutdown.mode, ShutdownMode::Restore) {
@@ -376,7 +369,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
             info!("Reloading configuration...");
             match PulsePlexConfig::load(&config_path_str) {
                 Ok(new_config) => {
-                    note_mappings = new_config
+                    engine.note_mappings = new_config
                         .mapping
                         .into_iter()
                         .map(|m| (m.note, m))
@@ -389,83 +382,20 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
             }
         }
 
-        // drain the sources
-        if let Ok(signals) = midi_source.poll() {
-            for signal in signals {
-                if terminal.is_some() {
-                    dashboard_state.push_signal(signal);
-                }
-                match signal {
-                    Signal::Trigger { id, velocity } => {
-                        if let Some(mapping) = note_mappings.get(&id) {
-                            debug!("Trigger: ID: {} Velocity: {}", id, velocity);
-
-                            let mut env = DecayEnvelope::new(
-                                mapping.decay_seconds,
-                                mapping.velocity_curve,
-                                mapping.decay_profile,
-                            );
-                            env.trigger(velocity);
-                            active_lights.insert(id, env);
-                        } else {
-                            trace!("Ignored unmapped trigger: {}", id);
-                        }
-                    }
-                    Signal::Release { id } => {
-                        trace!("Release: {}", id);
-                    }
-                    Signal::Clock => {
-                        trace!("Clock Tick");
-                    }
-                }
-            }
-        }
-
-        // update decay envelopes
-        active_lights.retain(|note, env| {
-            env.tick(delta_time);
-            if env.is_dead() {
-                debug!("Note {} envelope finished decay and was removed.", note);
-                false
-            } else {
-                trace!("Note {}: DMX Value {}", note, env.dmx_value());
-                true
-            }
-        });
-
-        // build the DMX frame
-        let mut dmx_frame = [0u8; 512];
-        for (note, env) in &active_lights {
-            if let Some(mapping) = note_mappings.get(note) {
-                if let Some([r, g, b]) = mapping.color {
-                    let r_val = (r as f32 * env.intensity) as u8;
-                    let g_val = (g as f32 * env.intensity) as u8;
-                    let b_val = (b as f32 * env.intensity) as u8;
-
-                    if mapping.dmx_channel < 512 {
-                        dmx_frame[mapping.dmx_channel] = r_val;
-                    }
-                    if mapping.dmx_channel + 1 < 512 {
-                        dmx_frame[mapping.dmx_channel + 1] = g_val;
-                    }
-                    if mapping.dmx_channel + 2 < 512 {
-                        dmx_frame[mapping.dmx_channel + 2] = b_val;
-                    }
-                } else if mapping.dmx_channel < 512 {
-                    dmx_frame[mapping.dmx_channel] = env.dmx_value();
-                }
-            }
-        }
-
-        // output
-        artnet_sink.send_state(&dmx_frame)?;
+        // Output and processing
+        let signals = engine.process_tick(delta_time, &mut midi_source, &mut [&mut artnet_sink])?;
 
         // Update TUI state
         if let Some(ref mut term) = terminal {
-            dashboard_state.dmx_channels = dmx_frame;
-            dashboard_state.active_notes = active_lights.len();
+            for signal in signals {
+                dashboard_state.push_signal(signal);
+            }
+            // Extract DMX data from the sink's bridge for visualization
+            dashboard_state.dmx_channels = *artnet_sink.bridge.dmx_data();
+            dashboard_state.active_notes = engine.active_lights.len();
             term.draw(|f| ui(f, &dashboard_state))?;
         }
+
         let sleep_start = Instant::now();
         if sleep_start < next_deadline {
             sleeper.sleep(next_deadline.duration_since(sleep_start));
@@ -621,7 +551,7 @@ fn handle_check(path: &str) -> anyhow::Result<()> {
     }
 
     // 3. Test DMX Bounds and Overlaps
-    let mut used_channels = std::collections::HashMap::new();
+    let mut used_channels = HashMap::new();
     for mapping in &config.mapping {
         let span = if mapping.color.is_some() { 3 } else { 1 };
 
