@@ -156,10 +156,28 @@ impl BroadcastSink {
 
 impl LightSink for BroadcastSink {
     fn send_state(&mut self, state: &[u8; 512]) -> anyhow::Result<()> {
-        for sink in &mut self.sinks {
-            sink.send_state(state)?;
+        let mut sent_to_any = false;
+        let mut first_err: Option<anyhow::Error> = None;
+
+        for (idx, sink) in self.sinks.iter_mut().enumerate() {
+            match sink.send_state(state) {
+                Ok(()) => {
+                    sent_to_any = true;
+                }
+                Err(err) => {
+                    warn!("Broadcast sink {} send_state failed: {err:#}", idx);
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
         }
-        Ok(())
+
+        if sent_to_any || self.sinks.is_empty() {
+            Ok(())
+        } else {
+            Err(first_err.unwrap_or_else(|| anyhow::anyhow!("All broadcast sinks failed")))
+        }
     }
 }
 
@@ -439,8 +457,18 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                                     for target in &applied_compiled.targets {
                                         match target {
                                             TargetConfig::ArtNet(artnet) => {
-                                                if let Ok(sink) = ArtNetSink::new(artnet.universe, &artnet.target_ip) {
-                                                    new_main_sink.add(Box::new(sink));
+                                                match ArtNetSink::new(artnet.universe, &artnet.target_ip) {
+                                                    Ok(sink) => {
+                                                        new_main_sink.add(Box::new(sink));
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            "Hot reload failed to recreate Art-Net target (universe={}, target_ip={}): {}",
+                                                            artnet.universe,
+                                                            artnet.target_ip,
+                                                            e
+                                                        );
+                                                    }
                                                 }
                                             }
                                             TargetConfig::Hue { .. } => {}
@@ -515,7 +543,9 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
         next_deadline = Instant::now().max(next_deadline) + target_interval;
     }
 
-    let _ = perform_shutdown(&config.shutdown, &mut main_sink, &initial_state);
+    if let Err(err) = perform_shutdown(&config.shutdown, &mut main_sink, &initial_state) {
+        warn!("Failed to perform shutdown lighting action: {err}");
+    }
 
     info!("PulsePlex shut down cleanly.");
     Ok(())
@@ -649,6 +679,11 @@ fn handle_check(path: &str) -> anyhow::Result<()> {
     }
 
     // 3. Test Network Strings for all targets
+    if config.targets.is_empty() {
+        println!("❌ Error: No lighting targets configured.");
+        bail!("Configuration check failed.");
+    }
+
     for target in &config.targets {
         match target {
             TargetConfig::ArtNet(artnet) => match SocketAddr::from_str(&artnet.target_ip) {
@@ -712,6 +747,89 @@ fn handle_check(path: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    use pulseplex_core::MockSink;
+
+    struct SharedMockSink {
+        inner: Arc<Mutex<MockSink>>,
+    }
+
+    impl SharedMockSink {
+        fn new(inner: Arc<Mutex<MockSink>>) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl LightSink for SharedMockSink {
+        fn send_state(&mut self, state: &[u8; 512]) -> anyhow::Result<()> {
+            self.inner.lock().unwrap().send_state(state)
+        }
+    }
+
+    struct FailingSink {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl FailingSink {
+        fn new(calls: Arc<Mutex<usize>>) -> Self {
+            Self { calls }
+        }
+    }
+
+    impl LightSink for FailingSink {
+        fn send_state(&mut self, _state: &[u8; 512]) -> anyhow::Result<()> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            Err(anyhow::anyhow!("intentional sink failure"))
+        }
+    }
+
+    #[test]
+    fn broadcast_sink_forwards_frames_to_all_sinks() {
+        let first = Arc::new(Mutex::new(MockSink::default()));
+        let second = Arc::new(Mutex::new(MockSink::default()));
+        let mut broadcast = BroadcastSink::new();
+
+        broadcast.add(Box::new(SharedMockSink::new(first.clone())));
+        broadcast.add(Box::new(SharedMockSink::new(second.clone())));
+
+        let mut frame = [0u8; 512];
+        frame[0] = 7;
+        frame[127] = 99;
+        frame[511] = 255;
+
+        broadcast.send_state(&frame).unwrap();
+
+        assert_eq!(first.lock().unwrap().frames.len(), 1);
+        assert_eq!(first.lock().unwrap().frames[0], frame);
+
+        assert_eq!(second.lock().unwrap().frames.len(), 1);
+        assert_eq!(second.lock().unwrap().frames[0], frame);
+    }
+
+    #[test]
+    fn broadcast_sink_continues_on_individual_failure() {
+        let first = Arc::new(Mutex::new(MockSink::default()));
+        let last = Arc::new(Mutex::new(MockSink::default()));
+        let failing_calls = Arc::new(Mutex::new(0));
+        let mut broadcast = BroadcastSink::new();
+
+        broadcast.add(Box::new(SharedMockSink::new(first.clone())));
+        broadcast.add(Box::new(FailingSink::new(failing_calls.clone())));
+        broadcast.add(Box::new(SharedMockSink::new(last.clone())));
+
+        let frame = [42u8; 512];
+
+        // Should return Ok because at least one sink succeeded
+        let result = broadcast.send_state(&frame);
+
+        assert!(result.is_ok());
+        assert_eq!(*failing_calls.lock().unwrap(), 1);
+
+        assert_eq!(first.lock().unwrap().frames.len(), 1);
+        assert_eq!(last.lock().unwrap().frames.len(), 1);
+    }
 
     #[test]
     fn test_artnet_sink_creation() {

@@ -92,9 +92,21 @@ impl PulsePlexConfig {
         let mut config: PulsePlexConfig = toml::from_str(&contents)
             .map_err(|e| anyhow::anyhow!("Failed to parse TOML: {}", e))?;
 
-        // Migration: Move legacy artnet config to targets
+        // Migration: Move legacy artnet config to targets, but avoid duplicating
+        // an equivalent Art-Net target when both formats are present.
         if let Some(artnet) = config.output.artnet.take() {
-            config.targets.push(TargetConfig::ArtNet(artnet));
+            let already_present = config.targets.iter().any(|target| {
+                matches!(
+                    target,
+                    TargetConfig::ArtNet(existing)
+                        if existing.target_ip == artnet.target_ip
+                            && existing.universe == artnet.universe
+                )
+            });
+
+            if !already_present {
+                config.targets.push(TargetConfig::ArtNet(artnet));
+            }
         }
 
         Ok(config)
@@ -103,16 +115,10 @@ impl PulsePlexConfig {
     /// Compiles the logical configuration into a high-performance internal representation.
     /// Returns an error if the logical chain is broken (orphaned IDs, missing behaviors, etc).
     pub fn compile(&self) -> Result<CompiledConfig> {
-        // 1. Gather all unique logical IDs and sort them for deterministic internal-ID assignment
+        // 1. Gather all unique logical IDs from behaviors and sort them for deterministic internal-ID assignment
         let mut all_ids: HashSet<&String> = HashSet::new();
         for b in &self.behavior {
             all_ids.insert(&b.id);
-        }
-        for id in self.midi.mappings.values() {
-            all_ids.insert(id);
-        }
-        for d in &self.output.dmx {
-            all_ids.insert(&d.id);
         }
 
         let mut sorted_ids: Vec<&String> = all_ids.into_iter().collect();
