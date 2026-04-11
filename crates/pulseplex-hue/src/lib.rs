@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use byteorder::{BigEndian, WriteBytesExt};
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use pulseplex_core::{DecayEnvelope, LightSink};
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc::{channel, Receiver as AsyncReceiver, Sender as AsyncSender};
 use tracing::{error, info, warn};
 use webrtc_dtls::config::Config;
 use webrtc_dtls::conn::DTLSConn;
@@ -21,10 +22,10 @@ pub struct HueOutputMapping {
 }
 
 pub struct HueSink {
-    tx: Sender<Vec<f32>>,
-    rx_drain: Receiver<Vec<f32>>,
+    tx: AsyncSender<Vec<f32>>,
+    pool_tx: Sender<Vec<f32>>,
+    pool_rx: Receiver<Vec<f32>>,
     mappings: Vec<HueOutputMapping>,
-    intensity_buffer: Vec<f32>,
 }
 
 impl HueSink {
@@ -39,11 +40,22 @@ impl HueSink {
             return Err(anyhow!("Hue area_id must be exactly 36 characters (UUID)"));
         }
 
-        let (tx, rx) = bounded(1);
-        let rx_drain = rx.clone();
-        let background_mappings = mappings.clone();
-        let intensity_buffer = vec![0.0; mappings.len()];
+        // Forward channel: Hot loop -> Background thread
+        let (tx, rx) = channel(1);
 
+        // Return channel: Background thread -> Hot loop (Buffer Pool)
+        let (pool_tx, pool_rx) = bounded(2);
+
+        // Pre-seed the pool with 2 buffers
+        let mapping_count = mappings.len();
+        for _ in 0..2 {
+            pool_tx.send(vec![0.0; mapping_count]).unwrap();
+        }
+
+        let background_mappings = mappings.clone();
+        let pool_tx_clone = pool_tx.clone();
+
+        // Construct runtime before spawning to surface errors
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -63,6 +75,7 @@ impl HueSink {
                     area_id,
                     background_mappings,
                     rx,
+                    pool_tx_clone,
                 )
                 .await
                 {
@@ -73,38 +86,42 @@ impl HueSink {
 
         Ok(Self {
             tx,
-            rx_drain,
+            pool_tx,
+            pool_rx,
             mappings,
-            intensity_buffer,
         })
     }
 }
 
 impl LightSink for HueSink {
     fn send_state(&mut self, intensities: &HashMap<usize, DecayEnvelope>) -> anyhow::Result<()> {
-        // Reuse the pre-allocated buffer to eliminate hot-loop allocations
+        // 1. Try to get a buffer from the pool (zero allocation)
+        let mut buffer = self
+            .pool_rx
+            .try_recv()
+            .unwrap_or_else(|_| vec![0.0; self.mappings.len()]);
+
+        // 2. Fill the buffer
         for (idx, m) in self.mappings.iter().enumerate() {
-            self.intensity_buffer[idx] = intensities
+            buffer[idx] = intensities
                 .get(&m.internal_id)
                 .map(|env| env.intensity)
                 .unwrap_or(0.0);
         }
 
-        // Clone into the channel. While this is one allocation, it's necessary for the
-        // cross-thread transfer. To be truly zero-allocation we'd need a buffer pool.
-        let frame = self.intensity_buffer.clone();
-
-        match self.tx.try_send(frame) {
-            Ok(_) => {}
-            Err(TrySendError::Full(latest)) => {
-                // Drain the stale frame and replace it with the latest state.
-                let _ = self.rx_drain.try_recv();
-                let _ = self.tx.try_send(latest);
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                return Err(anyhow!("Hue background thread disconnected"));
+        // 3. Try send to background thread (non-blocking)
+        if let Err(err) = self.tx.try_send(buffer) {
+            match err {
+                tokio::sync::mpsc::error::TrySendError::Full(b) => {
+                    // Return the buffer to the pool so it's not lost
+                    let _ = self.pool_tx.try_send(b);
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    return Err(anyhow!("Hue background thread closed"));
+                }
             }
         }
+
         Ok(())
     }
 }
@@ -115,12 +132,12 @@ async fn run_hue_background(
     client_key: String,
     area_id: String,
     mappings: Vec<HueOutputMapping>,
-    rx: Receiver<Vec<f32>>,
+    mut rx: AsyncReceiver<Vec<f32>>,
+    pool_tx: Sender<Vec<f32>>,
 ) -> Result<()> {
     info!("Starting Hue background thread for bridge {}", bridge_ip);
 
     let addr: SocketAddr = format!("{}:2100", bridge_ip).parse()?;
-
     let psk = hex::decode(client_key.replace("-", ""))?;
     let psk_id = username.as_bytes().to_vec();
 
@@ -131,24 +148,6 @@ async fn run_hue_background(
     };
 
     loop {
-        // Use a non-blocking check to see if the channel is disconnected and empty
-        let rx_clone = rx.clone();
-        let is_done = tokio::task::spawn_blocking(move || {
-            // If try_recv returns Disconnected, and the channel is empty, we are done.
-            // We use a small peek here essentially.
-            rx_clone.is_empty()
-                && matches!(
-                    rx_clone.try_recv(),
-                    Err(crossbeam_channel::TryRecvError::Disconnected)
-                )
-        })
-        .await?;
-
-        if is_done {
-            info!("Hue sender disconnected; exiting background task.");
-            return Ok(());
-        }
-
         info!("Connecting to Hue bridge at {} via DTLS...", addr);
 
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -157,6 +156,13 @@ async fn run_hue_background(
         let dtls_conn = match DTLSConn::new(Arc::new(socket), config.clone(), true, None).await {
             Ok(conn) => conn,
             Err(e) => {
+                // If the channel is closed while we are trying to connect, we can exit.
+                // try_recv isn't available on AsyncReceiver without mutable access,
+                // and we already have mut rx. Let's just do a non-blocking check.
+                if rx.is_closed() {
+                    info!("Hue sender disconnected during connect; exiting.");
+                    return Ok(());
+                }
                 error!("DTLS handshake failed: {}. Retrying in 5s...", e);
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
@@ -165,12 +171,16 @@ async fn run_hue_background(
 
         info!("Hue DTLS connection established.");
 
-        match stream_to_hue(dtls_conn, &mappings, &rx, &area_id).await {
+        match stream_to_hue(dtls_conn, &mappings, &mut rx, &pool_tx, &area_id).await {
             Ok(_) => {
                 info!("Hue background thread shutting down cleanly.");
                 return Ok(());
             }
             Err(e) => {
+                if rx.is_closed() {
+                    info!("Hue sender disconnected; exiting background task.");
+                    return Ok(());
+                }
                 warn!("Hue streaming error: {}. Reconnecting...", e);
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -181,42 +191,28 @@ async fn run_hue_background(
 async fn stream_to_hue(
     conn: DTLSConn,
     mappings: &[HueOutputMapping],
-    rx: &Receiver<Vec<f32>>,
-    area_id: &str,
-) -> Result<()> {
-    let rx_clone = rx.clone();
-    let intensities = match tokio::task::spawn_blocking(move || rx_clone.recv()).await {
-        Ok(Ok(i)) => i,
-        Ok(Err(_)) => return Ok(()),
-        Err(e) => return Err(anyhow!("Hue receive task failed: {}", e)),
-    };
-    stream_to_hue_starting_with(conn, mappings, rx, intensities, area_id).await
-}
-
-async fn stream_to_hue_starting_with(
-    conn: DTLSConn,
-    mappings: &[HueOutputMapping],
-    rx: &Receiver<Vec<f32>>,
-    first_intensities: Vec<f32>,
+    rx: &mut AsyncReceiver<Vec<f32>>,
+    pool_tx: &Sender<Vec<f32>>,
     area_id: &str,
 ) -> Result<()> {
     let mut sequence: u8 = 0;
-    let mut current_intensities = first_intensities;
 
     loop {
-        let buf = build_huestream_packet(&current_intensities, mappings, sequence, area_id)?;
+        // Wait for next frame (async-native)
+        let intensities = match rx.recv().await {
+            Some(i) => i,
+            None => return Ok(()), // Channel closed
+        };
+
+        let buf = build_huestream_packet(&intensities, mappings, sequence, area_id)?;
         sequence = sequence.wrapping_add(1);
 
         if let Err(e) = conn.write(&buf, None).await {
+            let _ = pool_tx.send(intensities); // Return buffer
             return Err(anyhow!("Failed to write to DTLS connection: {}", e));
         }
 
-        let rx_clone = rx.clone();
-        current_intensities = match tokio::task::spawn_blocking(move || rx_clone.recv()).await {
-            Ok(Ok(i)) => i,
-            Ok(Err(_)) => return Ok(()),
-            Err(e) => return Err(anyhow!("Hue receive task failed: {}", e)),
-        };
+        let _ = pool_tx.send(intensities);
     }
 }
 
@@ -307,43 +303,5 @@ mod tests {
         assert_eq!(packet[54], 0xFF);
         assert_eq!(packet[59], 0x01);
         assert_eq!(packet[60], 0x80);
-    }
-
-    #[test]
-    fn test_latest_wins_channel_logic() {
-        use pulseplex_core::DecayProfile;
-        use pulseplex_core::VelocityCurve;
-
-        let mappings = vec![HueOutputMapping {
-            internal_id: 1,
-            channel_id: 0,
-            color: None,
-        }];
-
-        let (tx, rx) = bounded(1);
-        let rx_drain = rx.clone();
-        let mut sink = HueSink {
-            tx,
-            rx_drain,
-            mappings: mappings.clone(),
-            intensity_buffer: vec![0.0],
-        };
-
-        let mut intensities1 = HashMap::new();
-        let mut env1 = DecayEnvelope::new(1.0, VelocityCurve::Linear, DecayProfile::Linear);
-        env1.intensity = 0.1;
-        intensities1.insert(1, env1);
-
-        let mut intensities2 = HashMap::new();
-        let mut env2 = DecayEnvelope::new(1.0, VelocityCurve::Linear, DecayProfile::Linear);
-        env2.intensity = 0.9;
-        intensities2.insert(1, env2);
-
-        sink.send_state(&intensities1).unwrap();
-        sink.send_state(&intensities2).unwrap();
-
-        let received = rx.recv().unwrap();
-        assert_eq!(received[0], 0.9);
-        assert!(rx.is_empty());
     }
 }

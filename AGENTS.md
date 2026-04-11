@@ -87,7 +87,3 @@ pub fn process_tick(rx: &Receiver<Signal>) {
 - 🚫 **Never:** Put a DTLS handshake, UDP socket write, or `std::thread::sleep`
   inside the `pulseplex-core` 40Hz orchestration loop. Network I/O must be
   isolated in background threads communicating via `crossbeam`.
-
-```
-
-```
