@@ -39,21 +39,19 @@ while let Ok(msg) = rx.try_recv() {
 
 ## Headless Execution & Safety
 
-- PulsePlex runs on headless servers (e.g., Raspberry Pi via systemd). Never
-  assume a TTY is available.
+- PulsePlex runs on headless servers (e.g., Raspberry Pi via systemd). Never assume a TTY is available.
 - Guard all interactive prompts with terminal checks.
-- Never use `unwrap()` or `expect()` in production code. Propagate errors using
-  `anyhow::Result` and `?`.
+- Propagate fallible errors (network I/O, user input, parsing) using `anyhow::Result` and `?`. 
+- Only use `unwrap()` or `expect()` inside `#[cfg(test)]` modules, or when an invariant is provably safe/infallible.
 
 ```rust
-// Avoid: Crashing in headless environments
-let selection = Select::new().interact().unwrap();
+// Avoid: Crashing on fallible I/O or user input
+let selection = Select::new().interact().unwrap(); 
 
-// Prefer: Fallbacks and terminal checks
-if std::io::stdin().is_terminal() {
-    let selection = Select::new().interact()?;
-} else {
-    anyhow::bail!("Headless mode: Required configuration is missing.");
+// Prefer: Provably safe unwraps (invariants guaranteed)
+pub fn dmx_data(&self) -> &[u8; 512] {
+    // SAFE: The slice is hardcoded to exactly 512 bytes (530 - 18)
+    self.buffer[18..530].try_into().unwrap() 
 }
 ```
 
