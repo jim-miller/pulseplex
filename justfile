@@ -41,18 +41,18 @@ test-watch:
 
 # --- Cross-Platform & Deployment ---
 
-# Build the release binary for local macOS testing
-build-mac:
+# Build the release binary for local testing
+build-release:
     cargo build --release
 
-# Build the release binary for Raspberry Pi (Linux ARM64)
-build-pi:
+# Build the release binary for Linux ARM64 (Requires: `cargo install cross`)
+build-arm:
     cross build --release --target aarch64-unknown-linux-gnu
 
 # Build and deploy directly to a remote server/device
 
 # Usage: just deploy-pi user@192.168.1.x
-deploy-pi TARGET: build-pi
+deploy-remote TARGET: build-pi
     @echo "Deploying to {{ TARGET }}..."
     scp target/aarch64-unknown-linux-gnu/release/pulseplex {{ TARGET }}:/tmp/pulseplex
     ssh {{ TARGET }} "sudo mv /tmp/pulseplex /usr/local/bin/pulseplex && sudo chmod +x /usr/local/bin/pulseplex"
