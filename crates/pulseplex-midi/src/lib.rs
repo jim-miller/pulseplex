@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{unbounded, Receiver, TryRecvError};
 use midir::{MidiInput, MidiInputConnection, MidiInputPort};
@@ -56,7 +58,7 @@ pub fn find_midi_port(midi_in: &midir::MidiInput, target_name: &str) -> Option<M
     None
 }
 
-pub fn setup_midi(target_device: &str) -> anyhow::Result<MidiReceiver> {
+pub fn setup_midi(target_device: &str, id_map: HashMap<u8, usize>) -> anyhow::Result<MidiReceiver> {
     let mut midi_in = MidiInput::new("pulseplex-input")?;
     midi_in.ignore(midir::Ignore::None);
 
@@ -79,14 +81,19 @@ pub fn setup_midi(target_device: &str) -> anyhow::Result<MidiReceiver> {
                     let note = message[1];
                     let velocity = message[2];
 
-                    match status {
-                        0x90 if velocity > 0 => {
-                            let _ = tx.send(Signal::Trigger { id: note, velocity });
+                    if let Some(&internal_id) = id_map.get(&note) {
+                        match status {
+                            0x90 if velocity > 0 => {
+                                let _ = tx.send(Signal::Trigger {
+                                    id: internal_id,
+                                    velocity,
+                                });
+                            }
+                            0x80 | 0x90 => {
+                                let _ = tx.send(Signal::Release { id: internal_id });
+                            }
+                            _ => {}
                         }
-                        0x80 | 0x90 => {
-                            let _ = tx.send(Signal::Release { id: note });
-                        }
-                        _ => {}
                     }
                 }
             },

@@ -12,36 +12,55 @@ mode = "Restore"
 # Leave device_name blank to force selection at startup
 device_name = ""
 
-[artnet]
-target_ip = "255.255.255.255:6454"
-universe = 0
+[midi.mappings]
+"36" = "kick"
+"38" = "snare"
+"42" = "hihat"
+"44" = "crash"
 
-[[mapping]]
-note = 36                     # Kick
-dmx_channel = 0
+[[behavior]]
+id = "kick"
 decay_seconds = 0.5
 velocity_curve = "hard"
 decay_profile = "exponential"
-color = [255, 0, 0]
 
-[[mapping]]
-note = 38                # Snare
-dmx_channel = 3
-decay_seconds = 0.2
-velocity_curve = "soft"
-decay_profile = "linear"
-color = [255, 255, 0]
-
-[[mapping]]
-note = 42                # Closed Hi-Hat
-dmx_channel = 7
+[[behavior]]
+id = "snare"
 decay_seconds = 0.2
 velocity_curve = "soft"
 decay_profile = "linear"
 
-[[mapping]]
-note = 44                # Crash Cymbal
-dmx_channel = 10
+[[behavior]]
+id = "hihat"
+decay_seconds = 0.2
+velocity_curve = "soft"
+decay_profile = "linear"
+
+[[behavior]]
+id = "crash"
 decay_seconds = 2.0
 velocity_curve = "hard"
 decay_profile = "linear"
+
+[output]
+[output.artnet]
+target_ip = "255.255.255.255:6454"
+universe = 0
+
+[[output.dmx]]
+id = "kick"
+channel = 0
+color = [255, 0, 0]
+
+[[output.dmx]]
+id = "snare"
+channel = 3
+color = [255, 255, 0]
+
+[[output.dmx]]
+id = "hihat"
+channel = 7
+
+[[output.dmx]]
+id = "crash"
+channel = 10

@@ -1,23 +1,47 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
-use anyhow::Result;
-use pulseplex_core::MappingConfig;
+use anyhow::{bail, Result};
+use pulseplex_core::{BehaviorConfig, DmxOutputConfig};
 use serde::Deserialize;
 use toml_edit::{value, DocumentMut};
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct PulsePlexConfig {
     pub midi: MidiConfig,
-    pub artnet: ArtNetConfig,
-    pub mapping: Vec<MappingConfig>,
+    pub behavior: Vec<BehaviorDefinition>,
+    pub output: OutputConfig,
     pub shutdown: ShutdownConfig,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct MidiConfig {
     pub device_name: String,
+    pub mappings: HashMap<u8, String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct BehaviorDefinition {
+    pub id: String,
+    pub decay_seconds: f32,
+    #[serde(default)]
+    pub velocity_curve: pulseplex_core::VelocityCurve,
+    #[serde(default)]
+    pub decay_profile: pulseplex_core::DecayProfile,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct OutputConfig {
+    pub artnet: ArtNetConfig,
+    pub dmx: Vec<DmxOutputDefinition>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct DmxOutputDefinition {
+    pub id: String,
+    pub channel: usize,
+    pub color: Option<[u8; 3]>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -39,6 +63,15 @@ pub struct ShutdownConfig {
     pub defaults: Option<HashMap<usize, u8>>,
 }
 
+#[derive(Clone)]
+pub struct CompiledConfig {
+    pub midi_device: String,
+    pub midi_id_map: HashMap<u8, usize>,
+    pub behaviors: HashMap<usize, BehaviorConfig>,
+    pub dmx_outputs: Vec<DmxOutputConfig>,
+    pub artnet: ArtNetConfig,
+}
+
 impl PulsePlexConfig {
     pub fn load(path: &str) -> Result<Self> {
         let contents = fs::read_to_string(path)
@@ -46,6 +79,93 @@ impl PulsePlexConfig {
         let config: PulsePlexConfig = toml::from_str(&contents)
             .map_err(|e| anyhow::anyhow!("Failed to parse TOML: {}", e))?;
         Ok(config)
+    }
+
+    /// Compiles the logical configuration into a high-performance internal representation.
+    /// Returns an error if the logical chain is broken (orphaned IDs, missing behaviors, etc).
+    pub fn compile(&self) -> Result<CompiledConfig> {
+        // 1. Gather all unique logical IDs and sort them for deterministic internal-ID assignment
+        let mut all_ids: HashSet<&String> = HashSet::new();
+        for b in &self.behavior {
+            all_ids.insert(&b.id);
+        }
+        for id in self.midi.mappings.values() {
+            all_ids.insert(id);
+        }
+        for d in &self.output.dmx {
+            all_ids.insert(&d.id);
+        }
+
+        let mut sorted_ids: Vec<&String> = all_ids.into_iter().collect();
+        sorted_ids.sort();
+
+        let id_map: HashMap<String, usize> = sorted_ids
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), i))
+            .collect();
+
+        // 2. Map behaviors and validate uniqueness
+        let mut behaviors = HashMap::new();
+        for b in &self.behavior {
+            let internal_id = *id_map.get(&b.id).unwrap();
+            if behaviors
+                .insert(
+                    internal_id,
+                    BehaviorConfig {
+                        decay_seconds: b.decay_seconds,
+                        velocity_curve: b.velocity_curve,
+                        decay_profile: b.decay_profile,
+                    },
+                )
+                .is_some()
+            {
+                bail!("Duplicate behavior ID defined: '{}'", b.id);
+            }
+        }
+
+        // 3. Map and validate MIDI inputs
+        let mut midi_id_map = HashMap::new();
+        for (note, logical_id) in &self.midi.mappings {
+            let internal_id = *id_map.get(logical_id).ok_or_else(|| {
+                anyhow::anyhow!("MIDI note {} maps to undefined ID '{}'", note, logical_id)
+            })?;
+
+            if !behaviors.contains_key(&internal_id) {
+                bail!(
+                    "MIDI note {} maps to ID '{}' which has no defined behavior",
+                    note,
+                    logical_id
+                );
+            }
+            midi_id_map.insert(*note, internal_id);
+        }
+
+        // 4. Map and validate DMX outputs
+        let mut dmx_outputs = Vec::new();
+        for d in &self.output.dmx {
+            let internal_id = *id_map
+                .get(&d.id)
+                .ok_or_else(|| anyhow::anyhow!("DMX output maps to undefined ID '{}'", d.id))?;
+
+            if !behaviors.contains_key(&internal_id) {
+                bail!("DMX output ID '{}' has no defined behavior", d.id);
+            }
+
+            dmx_outputs.push(DmxOutputConfig {
+                internal_id,
+                dmx_channel: d.channel,
+                color: d.color,
+            });
+        }
+
+        Ok(CompiledConfig {
+            midi_device: self.midi.device_name.clone(),
+            midi_id_map,
+            behaviors,
+            dmx_outputs,
+            artnet: self.output.artnet.clone(),
+        })
     }
 }
 
