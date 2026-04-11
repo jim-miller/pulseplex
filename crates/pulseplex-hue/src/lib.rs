@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use byteorder::{BigEndian, WriteBytesExt};
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use pulseplex_core::{DecayEnvelope, LightSink};
 use tokio::net::UdpSocket;
 use tracing::{error, info, warn};
@@ -21,7 +21,8 @@ pub struct HueOutputMapping {
 }
 
 pub struct HueSink {
-    tx: Sender<HashMap<usize, f32>>,
+    tx: Sender<Vec<f32>>,
+    mappings: Vec<HueOutputMapping>,
 }
 
 impl HueSink {
@@ -31,8 +32,11 @@ impl HueSink {
         client_key: String,
         mappings: Vec<HueOutputMapping>,
     ) -> Result<Self> {
-        let (tx, rx) = unbounded();
+        // Capacity 1: we only care about the latest frame.
+        // If the background thread is busy, we drop the current frame to keep the hot loop fast.
+        let (tx, rx) = bounded(1);
 
+        let background_mappings = mappings.clone();
         // Spawn background thread for DTLS streaming
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -42,27 +46,32 @@ impl HueSink {
 
             rt.block_on(async {
                 if let Err(e) =
-                    run_hue_background(bridge_ip, username, client_key, mappings, rx).await
+                    run_hue_background(bridge_ip, username, client_key, background_mappings, rx)
+                        .await
                 {
                     error!("Hue background thread failed: {}", e);
                 }
             });
         });
 
-        Ok(Self { tx })
+        Ok(Self { tx, mappings })
     }
 }
 
 impl LightSink for HueSink {
     fn send_state(&mut self, intensities: &HashMap<usize, DecayEnvelope>) -> anyhow::Result<()> {
-        // We only send the raw intensities to the background thread to keep the hot loop fast.
-        let mut simplified = HashMap::with_capacity(intensities.len());
-        for (&id, env) in intensities {
-            simplified.insert(id, env.intensity);
+        // Zero-allocation aligned buffer for the channel
+        let mut buffer = Vec::with_capacity(self.mappings.len());
+        for m in &self.mappings {
+            let intensity = intensities
+                .get(&m.internal_id)
+                .map(|env| env.intensity)
+                .unwrap_or(0.0);
+            buffer.push(intensity);
         }
 
-        // try_send to avoid blocking the hot loop. If the background thread is busy, we drop the frame.
-        let _ = self.tx.try_send(simplified);
+        // try_send to avoid blocking the hot loop. capacity is 1, so we drop if full.
+        let _ = self.tx.try_send(buffer);
         Ok(())
     }
 }
@@ -72,7 +81,7 @@ async fn run_hue_background(
     username: String,
     client_key: String,
     mappings: Vec<HueOutputMapping>,
-    rx: Receiver<HashMap<usize, f32>>,
+    rx: Receiver<Vec<f32>>,
 ) -> Result<()> {
     info!("Starting Hue background thread for bridge {}", bridge_ip);
 
@@ -94,8 +103,6 @@ async fn run_hue_background(
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         socket.connect(addr).await?;
 
-        // webrtc-dtls doesn't have a simple "connect" for client side PSK easily?
-        // Actually, it does.
         let dtls_conn = match DTLSConn::new(Arc::new(socket), config.clone(), true, None).await {
             Ok(conn) => conn,
             Err(e) => {
@@ -107,9 +114,15 @@ async fn run_hue_background(
 
         info!("Hue DTLS connection established.");
 
-        if let Err(e) = stream_to_hue(dtls_conn, &mappings, &rx).await {
-            warn!("Hue streaming error: {}. Reconnecting...", e);
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        match stream_to_hue(dtls_conn, &mappings, &rx).await {
+            Ok(_) => {
+                info!("Hue background thread shutting down (channel closed).");
+                return Ok(());
+            }
+            Err(e) => {
+                warn!("Hue streaming error: {}. Reconnecting...", e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         }
     }
 }
@@ -117,57 +130,116 @@ async fn run_hue_background(
 async fn stream_to_hue(
     conn: DTLSConn,
     mappings: &[HueOutputMapping],
-    rx: &Receiver<HashMap<usize, f32>>,
+    rx: &Receiver<Vec<f32>>,
 ) -> Result<()> {
     let mut sequence: u8 = 0;
 
     loop {
         // Wait for next frame from the hot loop
-        // We use recv() here because this is a dedicated background thread.
         let intensities = match rx.recv() {
             Ok(i) => i,
-            Err(_) => return Ok(()), // Channel closed
+            Err(_) => return Ok(()), // Channel closed, shutdown thread
         };
 
-        // Format HueStream packet
-        let mut buf = Vec::with_capacity(16 + mappings.len() * 9);
-
-        // Header
-        buf.extend_from_slice(b"HueStream");
-        buf.push(0x01); // Version Major
-        buf.push(0x00); // Version Minor
-        buf.push(sequence);
-        buf.extend_from_slice(&[0x00, 0x00]); // Reserved
-        buf.push(0x00); // Color Space RGB
-        buf.push(0x00); // Reserved
-
+        let buf = build_huestream_packet(&intensities, mappings, sequence)?;
         sequence = sequence.wrapping_add(1);
-
-        // Lights
-        for m in mappings {
-            let intensity = intensities.get(&m.internal_id).cloned().unwrap_or(0.0);
-
-            let (r, g, b) = if let Some([rc, gc, bc]) = m.color {
-                (
-                    (rc as f32 * intensity) as u16 * 257,
-                    (gc as f32 * intensity) as u16 * 257,
-                    (bc as f32 * intensity) as u16 * 257,
-                )
-            } else {
-                let val = (intensity * 65535.0) as u16;
-                (val, val, val)
-            };
-
-            buf.push(0x00); // Type Light
-            buf.write_u16::<BigEndian>(m.light_id)?;
-            buf.write_u16::<BigEndian>(r)?;
-            buf.write_u16::<BigEndian>(g)?;
-            buf.write_u16::<BigEndian>(b)?;
-        }
 
         // Send over DTLS
         if let Err(e) = conn.write(&buf, None).await {
             return Err(anyhow!("Failed to write to DTLS connection: {}", e));
         }
+    }
+}
+
+/// Pure helper to build HueStream binary packets for testing.
+pub fn build_huestream_packet(
+    intensities: &[f32],
+    mappings: &[HueOutputMapping],
+    sequence: u8,
+) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(16 + mappings.len() * 9);
+
+    // Header
+    buf.extend_from_slice(b"HueStream");
+    buf.push(0x01); // Version Major
+    buf.push(0x00); // Version Minor
+    buf.push(sequence);
+    buf.extend_from_slice(&[0x00, 0x00]); // Reserved
+    buf.push(0x00); // Color Space RGB
+    buf.push(0x00); // Reserved
+
+    // Lights
+    for (idx, m) in mappings.iter().enumerate() {
+        let intensity = intensities.get(idx).cloned().unwrap_or(0.0);
+
+        let (r, g, b) = if let Some([rc, gc, bc]) = m.color {
+            (
+                (rc as f32 * intensity) as u16 * 257,
+                (gc as f32 * intensity) as u16 * 257,
+                (bc as f32 * intensity) as u16 * 257,
+            )
+        } else {
+            let val = (intensity * 65535.0) as u16;
+            (val, val, val)
+        };
+
+        buf.push(0x00); // Type Light
+        buf.write_u16::<BigEndian>(m.light_id)?;
+        buf.write_u16::<BigEndian>(r)?;
+        buf.write_u16::<BigEndian>(g)?;
+        buf.write_u16::<BigEndian>(b)?;
+    }
+
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_huestream_packet_layout() {
+        let mappings = vec![
+            HueOutputMapping {
+                internal_id: 1,
+                light_id: 10,
+                color: Some([255, 128, 0]),
+            },
+            HueOutputMapping {
+                internal_id: 2,
+                light_id: 11,
+                color: None, // Grayscale
+            },
+        ];
+
+        let intensities = vec![1.0, 0.5];
+        let sequence = 42;
+
+        let packet = build_huestream_packet(&intensities, &mappings, sequence).unwrap();
+
+        // Header
+        assert_eq!(&packet[0..9], b"HueStream");
+        assert_eq!(packet[9], 0x01); // Version Major
+        assert_eq!(packet[11], sequence);
+
+        // Light 1 (RGB)
+        // Offset 16: Type (0x00)
+        // Offset 17-18: ID (10 -> 0x000A)
+        // Offset 19-20: R (255 * 1.0 * 257 = 65535 -> 0xFFFF)
+        assert_eq!(packet[16], 0x00);
+        assert_eq!(packet[17], 0x00);
+        assert_eq!(packet[18], 0x0A);
+        assert_eq!(packet[19], 0xFF);
+        assert_eq!(packet[20], 0xFF);
+
+        // Light 2 (Grayscale)
+        // Offset 16 + 9 = 25
+        // ID 11 -> 0x000B
+        // Value 0.5 * 65535 = 32767 -> 0x7FFF
+        assert_eq!(packet[25], 0x00);
+        assert_eq!(packet[26], 0x00);
+        assert_eq!(packet[27], 0x0B);
+        assert_eq!(packet[28], 0x7F);
+        assert_eq!(packet[29], 0xFF);
     }
 }

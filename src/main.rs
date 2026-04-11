@@ -132,7 +132,7 @@ impl ArtNetSink {
     }
 
     /// Internal helper to build the DMX frame.
-    pub fn build_frame(&mut self, intensities: &HashMap<usize, DecayEnvelope>) -> [u8; 512] {
+    pub fn build_frame(&self, intensities: &HashMap<usize, DecayEnvelope>) -> [u8; 512] {
         let mut frame = [0u8; 512];
         for m in &self.mappings {
             if let Some(env) = intensities.get(&m.internal_id) {
@@ -382,13 +382,13 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
     for target in &compiled.targets {
         match target {
             TargetConfig::ArtNet(artnet) => {
-                let mut sink = ArtNetSink::new(
+                let mut sink = Box::new(ArtNetSink::new(
                     artnet.universe,
                     &artnet.target_ip,
                     compiled.dmx_outputs.clone(),
-                )?;
-                artnet_sink_ptr = Some(&mut sink as *mut ArtNetSink);
-                main_sink.add(Box::new(sink));
+                )?);
+                artnet_sink_ptr = Some(&mut *sink as *mut ArtNetSink);
+                main_sink.add(sink);
                 info!("Initialized Art-Net sink for universe {}", artnet.universe);
             }
             TargetConfig::Hue(hue) => {
@@ -502,7 +502,10 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                     match new_config.compile() {
                         Ok(new_compiled) => {
                             // Update MIDI source with new ID map
-                            match setup_midi(&new_compiled.midi_device, new_compiled.midi_id_map.clone()) {
+                            match setup_midi(
+                                &new_compiled.midi_device,
+                                new_compiled.midi_id_map.clone(),
+                            ) {
                                 Ok(new_midi_source) => {
                                     let mut applied_compiled = new_compiled;
 
@@ -513,10 +516,17 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                                     for target in &applied_compiled.targets {
                                         match target {
                                             TargetConfig::ArtNet(artnet) => {
-                                                match ArtNetSink::new(artnet.universe, &artnet.target_ip, applied_compiled.dmx_outputs.clone()) {
-                                                    Ok(mut sink) => {
-                                                        new_artnet_sink_ptr = Some(&mut sink as *mut ArtNetSink);
-                                                        new_main_sink.add(Box::new(sink));
+                                                match ArtNetSink::new(
+                                                    artnet.universe,
+                                                    &artnet.target_ip,
+                                                    applied_compiled.dmx_outputs.clone(),
+                                                ) {
+                                                    Ok(sink) => {
+                                                        let mut sink_box = Box::new(sink);
+                                                        new_artnet_sink_ptr = Some(
+                                                            &mut *sink_box as *mut ArtNetSink,
+                                                        );
+                                                        new_main_sink.add(sink_box);
                                                     }
                                                     Err(e) => {
                                                         warn!(
@@ -529,16 +539,26 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                                                 }
                                             }
                                             TargetConfig::Hue(hue) => {
-                                                let hue_mappings = applied_compiled.hue_outputs.iter().map(|h| {
-                                                    HueOutputMapping {
+                                                let hue_mappings = applied_compiled
+                                                    .hue_outputs
+                                                    .iter()
+                                                    .map(|h| HueOutputMapping {
                                                         internal_id: h.internal_id,
                                                         light_id: h.light_id,
                                                         color: h.color,
-                                                    }
-                                                }).collect();
-                                                match HueSink::new(hue.bridge_ip.clone(), hue.username.clone(), hue.client_key.clone(), hue_mappings) {
+                                                    })
+                                                    .collect();
+                                                match HueSink::new(
+                                                    hue.bridge_ip.clone(),
+                                                    hue.username.clone(),
+                                                    hue.client_key.clone(),
+                                                    hue_mappings,
+                                                ) {
                                                     Ok(sink) => new_main_sink.add(Box::new(sink)),
-                                                    Err(e) => warn!("Hot reload failed to recreate Hue sink: {}", e),
+                                                    Err(e) => warn!(
+                                                        "Hot reload failed to recreate Hue sink: {}",
+                                                        e
+                                                    ),
                                                 }
                                             }
                                         }
@@ -552,9 +572,8 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                                     }
 
                                     midi_source = new_midi_source;
-                                    engine = PulsePlexEngine::new(
-                                        applied_compiled.behaviors.clone(),
-                                    );
+                                    engine =
+                                        PulsePlexEngine::new(applied_compiled.behaviors.clone());
                                     config = new_config;
                                     compiled = applied_compiled;
                                     info!("Reload successful.");
@@ -890,5 +909,83 @@ mod tests {
 
         assert_eq!(first.lock().unwrap().states.len(), 1);
         assert_eq!(last.lock().unwrap().states.len(), 1);
+    }
+
+    #[test]
+    fn test_artnet_sink_creation() {
+        let sink = ArtNetSink::new(1, "127.0.0.1:6454", vec![]);
+        assert!(sink.is_ok());
+
+        let invalid_sink = ArtNetSink::new(1, "invalid_ip", vec![]);
+        assert!(invalid_sink.is_err());
+    }
+
+    #[test]
+    fn test_artnet_sink_send_state() {
+        let mut sink = ArtNetSink::new(1, "127.0.0.1:6454", vec![]).unwrap();
+        let intensities = HashMap::new();
+        let result = sink.send_state(&intensities);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_artnet_build_frame_boundaries() {
+        use pulseplex_core::{DecayEnvelope, DecayProfile, VelocityCurve};
+
+        let mappings = vec![
+            DmxOutputCompiled {
+                internal_id: 1,
+                dmx_channel: 0,
+                color: None,
+            },
+            DmxOutputCompiled {
+                internal_id: 2,
+                dmx_channel: 511,
+                color: None,
+            },
+            DmxOutputCompiled {
+                internal_id: 3,
+                dmx_channel: 10,
+                color: Some([255, 128, 64]),
+            },
+        ];
+
+        let sink = ArtNetSink::new(0, "127.0.0.1:6454", mappings).unwrap();
+        let mut intensities = HashMap::new();
+
+        let mut env1 = DecayEnvelope::new(1.0, VelocityCurve::Linear, DecayProfile::Linear);
+        env1.intensity = 1.0;
+        let mut env2 = DecayEnvelope::new(1.0, VelocityCurve::Linear, DecayProfile::Linear);
+        env2.intensity = 0.5;
+        let mut env3 = DecayEnvelope::new(1.0, VelocityCurve::Linear, DecayProfile::Linear);
+        env3.intensity = 1.0;
+
+        intensities.insert(1, env1);
+        intensities.insert(2, env2);
+        intensities.insert(3, env3);
+
+        let frame = sink.build_frame(&intensities);
+
+        assert_eq!(frame[0], 255);
+        assert_eq!(frame[511], 127);
+        assert_eq!(frame[10], 255);
+        assert_eq!(frame[11], 128);
+        assert_eq!(frame[12], 64);
+    }
+
+    #[test]
+    fn test_perform_shutdown_blackout() {
+        use pulseplex_core::MockSink;
+
+        let config = crate::config::ShutdownConfig {
+            mode: ShutdownMode::Blackout,
+            defaults: None,
+        };
+        let mut sink = MockSink::default();
+        let initial_state = [255u8; 512];
+
+        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
+        assert_eq!(sink.states.len(), 1);
+        assert!(sink.states[0].is_empty() || sink.states[0].values().all(|&v| v == 0.0));
     }
 }
