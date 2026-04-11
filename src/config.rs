@@ -12,6 +12,8 @@ pub struct PulsePlexConfig {
     pub midi: MidiConfig,
     pub behavior: Vec<BehaviorDefinition>,
     pub output: OutputConfig,
+    #[serde(default)]
+    pub targets: Vec<TargetConfig>,
     pub shutdown: ShutdownConfig,
 }
 
@@ -33,8 +35,19 @@ pub struct BehaviorDefinition {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct OutputConfig {
-    pub artnet: ArtNetConfig,
+    pub artnet: Option<ArtNetConfig>,
     pub dmx: Vec<DmxOutputDefinition>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum TargetConfig {
+    ArtNet(ArtNetConfig),
+    #[allow(dead_code)]
+    Hue {
+        bridge_ip: String,
+        app_key: String,
+    },
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -69,31 +82,43 @@ pub struct CompiledConfig {
     pub midi_id_map: HashMap<u8, usize>,
     pub behaviors: HashMap<usize, BehaviorConfig>,
     pub dmx_outputs: Vec<DmxOutputConfig>,
-    pub artnet: ArtNetConfig,
+    pub targets: Vec<TargetConfig>,
 }
 
 impl PulsePlexConfig {
     pub fn load(path: &str) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("Failed to read config file {}: {}", path, e))?;
-        let config: PulsePlexConfig = toml::from_str(&contents)
+        let mut config: PulsePlexConfig = toml::from_str(&contents)
             .map_err(|e| anyhow::anyhow!("Failed to parse TOML: {}", e))?;
+
+        // Migration: Move legacy artnet config to targets, but avoid duplicating
+        // an equivalent Art-Net target when both formats are present.
+        if let Some(artnet) = config.output.artnet.take() {
+            let already_present = config.targets.iter().any(|target| {
+                matches!(
+                    target,
+                    TargetConfig::ArtNet(existing)
+                        if existing.target_ip == artnet.target_ip
+                            && existing.universe == artnet.universe
+                )
+            });
+
+            if !already_present {
+                config.targets.push(TargetConfig::ArtNet(artnet));
+            }
+        }
+
         Ok(config)
     }
 
     /// Compiles the logical configuration into a high-performance internal representation.
     /// Returns an error if the logical chain is broken (orphaned IDs, missing behaviors, etc).
     pub fn compile(&self) -> Result<CompiledConfig> {
-        // 1. Gather all unique logical IDs and sort them for deterministic internal-ID assignment
+        // 1. Gather all unique logical IDs from behaviors and sort them for deterministic internal-ID assignment
         let mut all_ids: HashSet<&String> = HashSet::new();
         for b in &self.behavior {
             all_ids.insert(&b.id);
-        }
-        for id in self.midi.mappings.values() {
-            all_ids.insert(id);
-        }
-        for d in &self.output.dmx {
-            all_ids.insert(&d.id);
         }
 
         let mut sorted_ids: Vec<&String> = all_ids.into_iter().collect();
@@ -108,7 +133,12 @@ impl PulsePlexConfig {
         // 2. Map behaviors and validate uniqueness
         let mut behaviors = HashMap::new();
         for b in &self.behavior {
-            let internal_id = *id_map.get(&b.id).unwrap();
+            let internal_id = *id_map.get(&b.id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Behavior ID '{}' was not assigned an internal ID during config compilation",
+                    b.id
+                )
+            })?;
             if behaviors
                 .insert(
                     internal_id,
@@ -164,7 +194,7 @@ impl PulsePlexConfig {
             midi_id_map,
             behaviors,
             dmx_outputs,
-            artnet: self.output.artnet.clone(),
+            targets: self.targets.clone(),
         })
     }
 }

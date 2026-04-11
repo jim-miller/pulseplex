@@ -29,6 +29,8 @@ use spin_sleep::SpinSleeper;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+use crate::config::TargetConfig;
+
 /// RAII Guard to ensure terminal state is restored on drop.
 struct TerminalGuard;
 
@@ -129,6 +131,53 @@ impl LightSink for ArtNetSink {
         self.socket.send_to(self.bridge.as_bytes(), self.addr)?;
         self.bridge.increment_sequence();
         Ok(())
+    }
+}
+
+/// A sink that broadcasts frames to multiple underlying sinks.
+#[derive(Default)]
+pub struct BroadcastSink {
+    sinks: Vec<Box<dyn LightSink>>,
+}
+
+impl BroadcastSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, sink: Box<dyn LightSink>) {
+        self.sinks.push(sink);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sinks.is_empty()
+    }
+}
+
+impl LightSink for BroadcastSink {
+    fn send_state(&mut self, state: &[u8; 512]) -> anyhow::Result<()> {
+        let mut sent_to_any = false;
+        let mut first_err: Option<anyhow::Error> = None;
+
+        for (idx, sink) in self.sinks.iter_mut().enumerate() {
+            match sink.send_state(state) {
+                Ok(()) => {
+                    sent_to_any = true;
+                }
+                Err(err) => {
+                    warn!("Broadcast sink {} send_state failed: {err:#}", idx);
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
+        }
+
+        if sent_to_any || self.sinks.is_empty() {
+            Ok(())
+        } else {
+            Err(first_err.unwrap_or_else(|| anyhow::anyhow!("All broadcast sinks failed")))
+        }
     }
 }
 
@@ -291,7 +340,28 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
 
     let mut compiled = config.compile()?;
 
-    let mut artnet_sink = ArtNetSink::new(compiled.artnet.universe, &compiled.artnet.target_ip)?;
+    // Initialize all configured sinks into a broadcast group
+    let mut main_sink = BroadcastSink::new();
+    for target in &compiled.targets {
+        match target {
+            TargetConfig::ArtNet(artnet) => {
+                let sink = ArtNetSink::new(artnet.universe, &artnet.target_ip)?;
+                main_sink.add(Box::new(sink));
+                info!("Initialized Art-Net sink for universe {}", artnet.universe);
+            }
+            TargetConfig::Hue { bridge_ip, .. } => {
+                warn!(
+                    "Philips Hue support is planned but not yet implemented (Bridge: {})",
+                    bridge_ip
+                );
+            }
+        }
+    }
+
+    if main_sink.is_empty() {
+        bail!("No valid lighting targets configured.");
+    }
+
     let mut midi_source = setup_midi(&compiled.midi_device, compiled.midi_id_map.clone())?;
 
     let mut engine = PulsePlexEngine::new(compiled.behaviors.clone(), compiled.dmx_outputs.clone());
@@ -381,19 +451,41 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                             match setup_midi(&new_compiled.midi_device, new_compiled.midi_id_map.clone()) {
                                 Ok(new_midi_source) => {
                                     let mut applied_compiled = new_compiled;
-                                    // Update Art-Net sink if network config changed
-                                    if applied_compiled.artnet.target_ip != compiled.artnet.target_ip || applied_compiled.artnet.universe != compiled.artnet.universe {
-                                        let previous_artnet = compiled.artnet.clone();
-                                        match ArtNetSink::new(applied_compiled.artnet.universe, &applied_compiled.artnet.target_ip) {
-                                            Ok(new_sink) => artnet_sink = new_sink,
-                                            Err(e) => {
-                                                warn!("Could not update Art-Net sink: {}. Using old connection.", e);
-                                                applied_compiled.artnet = previous_artnet;
+
+                                    // Re-initialize sinks
+                                    let mut new_main_sink = BroadcastSink::new();
+                                    for target in &applied_compiled.targets {
+                                        match target {
+                                            TargetConfig::ArtNet(artnet) => {
+                                                match ArtNetSink::new(artnet.universe, &artnet.target_ip) {
+                                                    Ok(sink) => {
+                                                        new_main_sink.add(Box::new(sink));
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            "Hot reload failed to recreate Art-Net target (universe={}, target_ip={}): {}",
+                                                            artnet.universe,
+                                                            artnet.target_ip,
+                                                            e
+                                                        );
+                                                    }
+                                                }
                                             }
+                                            TargetConfig::Hue { .. } => {}
                                         }
                                     }
+                                    if !new_main_sink.is_empty() {
+                                        main_sink = new_main_sink;
+                                    } else {
+                                        warn!("Hot reload failed to initialize any targets. Keeping old targets.");
+                                        applied_compiled.targets = compiled.targets.clone();
+                                    }
+
                                     midi_source = new_midi_source;
-                                    engine = PulsePlexEngine::new(applied_compiled.behaviors.clone(), applied_compiled.dmx_outputs.clone());
+                                    engine = PulsePlexEngine::new(
+                                        applied_compiled.behaviors.clone(),
+                                        applied_compiled.dmx_outputs.clone(),
+                                    );
                                     config = new_config;
                                     compiled = applied_compiled;
                                     info!("Reload successful.");
@@ -417,7 +509,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
         if let Err(e) = engine.process_tick(
             delta_time,
             &mut midi_source,
-            &mut [&mut artnet_sink],
+            &mut [&mut main_sink],
             &mut signal_buffer,
             &mut frame_buffer,
         ) {
@@ -451,7 +543,9 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
         next_deadline = Instant::now().max(next_deadline) + target_interval;
     }
 
-    perform_shutdown(&config.shutdown, &mut artnet_sink, &initial_state)?;
+    if let Err(err) = perform_shutdown(&config.shutdown, &mut main_sink, &initial_state) {
+        warn!("Failed to perform shutdown lighting action: {err}");
+    }
 
     info!("PulsePlex shut down cleanly.");
     Ok(())
@@ -584,21 +678,36 @@ fn handle_check(path: &str) -> anyhow::Result<()> {
         }
     }
 
-    // 3. Test Art-Net Network String
-    match SocketAddr::from_str(&config.output.artnet.target_ip) {
-        Ok(_) => println!("✅ Network: Target IP/Port format is valid"),
-        Err(_) => {
-            if config.output.artnet.target_ip.to_socket_addrs().is_ok() {
+    // 3. Test Network Strings for all targets
+    if config.targets.is_empty() {
+        println!("❌ Error: No lighting targets configured.");
+        bail!("Configuration check failed.");
+    }
+
+    for target in &config.targets {
+        match target {
+            TargetConfig::ArtNet(artnet) => match SocketAddr::from_str(&artnet.target_ip) {
+                Ok(_) => println!("✅ Network (Art-Net): Target IP/Port format is valid"),
+                Err(_) => {
+                    if artnet.target_ip.to_socket_addrs().is_ok() {
+                        println!(
+                            "⚠️  Network: '{}' is a valid hostname/shorthand, but not a literal IP",
+                            artnet.target_ip
+                        );
+                    } else {
+                        println!(
+                            "❌ Network: Invalid target_ip format '{}'",
+                            artnet.target_ip
+                        );
+                        bail!("Configuration check failed.");
+                    }
+                }
+            },
+            TargetConfig::Hue { bridge_ip, .. } => {
                 println!(
-                    "⚠️  Network: '{}' is a valid hostname/shorthand, but not a literal IP",
-                    config.output.artnet.target_ip
+                    "⚠️  Network (Hue): Philips Hue check is not yet implemented (Bridge: {})",
+                    bridge_ip
                 );
-            } else {
-                println!(
-                    "❌ Network: Invalid target_ip format '{}'",
-                    config.output.artnet.target_ip
-                );
-                bail!("Configuration check failed.");
             }
         }
     }
@@ -638,6 +747,89 @@ fn handle_check(path: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    use pulseplex_core::MockSink;
+
+    struct SharedMockSink {
+        inner: Arc<Mutex<MockSink>>,
+    }
+
+    impl SharedMockSink {
+        fn new(inner: Arc<Mutex<MockSink>>) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl LightSink for SharedMockSink {
+        fn send_state(&mut self, state: &[u8; 512]) -> anyhow::Result<()> {
+            self.inner.lock().unwrap().send_state(state)
+        }
+    }
+
+    struct FailingSink {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl FailingSink {
+        fn new(calls: Arc<Mutex<usize>>) -> Self {
+            Self { calls }
+        }
+    }
+
+    impl LightSink for FailingSink {
+        fn send_state(&mut self, _state: &[u8; 512]) -> anyhow::Result<()> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            Err(anyhow::anyhow!("intentional sink failure"))
+        }
+    }
+
+    #[test]
+    fn broadcast_sink_forwards_frames_to_all_sinks() {
+        let first = Arc::new(Mutex::new(MockSink::default()));
+        let second = Arc::new(Mutex::new(MockSink::default()));
+        let mut broadcast = BroadcastSink::new();
+
+        broadcast.add(Box::new(SharedMockSink::new(first.clone())));
+        broadcast.add(Box::new(SharedMockSink::new(second.clone())));
+
+        let mut frame = [0u8; 512];
+        frame[0] = 7;
+        frame[127] = 99;
+        frame[511] = 255;
+
+        broadcast.send_state(&frame).unwrap();
+
+        assert_eq!(first.lock().unwrap().frames.len(), 1);
+        assert_eq!(first.lock().unwrap().frames[0], frame);
+
+        assert_eq!(second.lock().unwrap().frames.len(), 1);
+        assert_eq!(second.lock().unwrap().frames[0], frame);
+    }
+
+    #[test]
+    fn broadcast_sink_continues_on_individual_failure() {
+        let first = Arc::new(Mutex::new(MockSink::default()));
+        let last = Arc::new(Mutex::new(MockSink::default()));
+        let failing_calls = Arc::new(Mutex::new(0));
+        let mut broadcast = BroadcastSink::new();
+
+        broadcast.add(Box::new(SharedMockSink::new(first.clone())));
+        broadcast.add(Box::new(FailingSink::new(failing_calls.clone())));
+        broadcast.add(Box::new(SharedMockSink::new(last.clone())));
+
+        let frame = [42u8; 512];
+
+        // Should return Ok because at least one sink succeeded
+        let result = broadcast.send_state(&frame);
+
+        assert!(result.is_ok());
+        assert_eq!(*failing_calls.lock().unwrap(), 1);
+
+        assert_eq!(first.lock().unwrap().frames.len(), 1);
+        assert_eq!(last.lock().unwrap().frames.len(), 1);
+    }
 
     #[test]
     fn test_artnet_sink_creation() {
