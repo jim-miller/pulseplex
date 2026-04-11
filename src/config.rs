@@ -86,7 +86,6 @@ pub enum ShutdownMode {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ShutdownConfig {
     pub mode: ShutdownMode,
-    #[allow(dead_code)]
     pub defaults: Option<HashMap<usize, u8>>,
 }
 

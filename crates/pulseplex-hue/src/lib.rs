@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use byteorder::{BigEndian, WriteBytesExt};
-use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use pulseplex_core::{DecayEnvelope, LightSink};
 use tokio::net::UdpSocket;
 use tracing::{error, info, warn};
@@ -24,6 +24,7 @@ pub struct HueSink {
     tx: Sender<Vec<f32>>,
     rx_drain: Receiver<Vec<f32>>,
     mappings: Vec<HueOutputMapping>,
+    intensity_buffer: Vec<f32>,
 }
 
 impl HueSink {
@@ -34,18 +35,15 @@ impl HueSink {
         area_id: String,
         mappings: Vec<HueOutputMapping>,
     ) -> Result<Self> {
-        // Validation: area_id must be a UUID (36 chars)
         if area_id.len() != 36 {
             return Err(anyhow!("Hue area_id must be exactly 36 characters (UUID)"));
         }
 
-        // Capacity 1: we only care about the latest frame.
         let (tx, rx) = bounded(1);
         let rx_drain = rx.clone();
-
         let background_mappings = mappings.clone();
+        let intensity_buffer = vec![0.0; mappings.len()];
 
-        // Construct runtime before spawning to surface errors
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -56,7 +54,6 @@ impl HueSink {
                 )
             })?;
 
-        // Spawn background thread for DTLS streaming
         std::thread::spawn(move || {
             rt.block_on(async {
                 if let Err(e) = run_hue_background(
@@ -78,25 +75,29 @@ impl HueSink {
             tx,
             rx_drain,
             mappings,
+            intensity_buffer,
         })
     }
 }
 
 impl LightSink for HueSink {
     fn send_state(&mut self, intensities: &HashMap<usize, DecayEnvelope>) -> anyhow::Result<()> {
-        let mut buffer = Vec::with_capacity(self.mappings.len());
-        for m in &self.mappings {
-            let intensity = intensities
+        // Reuse the pre-allocated buffer to eliminate hot-loop allocations
+        for (idx, m) in self.mappings.iter().enumerate() {
+            self.intensity_buffer[idx] = intensities
                 .get(&m.internal_id)
                 .map(|env| env.intensity)
                 .unwrap_or(0.0);
-            buffer.push(intensity);
         }
 
-        // "Latest-wins" strategy
-        match self.tx.try_send(buffer) {
+        // Clone into the channel. While this is one allocation, it's necessary for the
+        // cross-thread transfer. To be truly zero-allocation we'd need a buffer pool.
+        let frame = self.intensity_buffer.clone();
+
+        match self.tx.try_send(frame) {
             Ok(_) => {}
             Err(TrySendError::Full(latest)) => {
+                // Drain the stale frame and replace it with the latest state.
                 let _ = self.rx_drain.try_recv();
                 let _ = self.tx.try_send(latest);
             }
@@ -130,37 +131,22 @@ async fn run_hue_background(
     };
 
     loop {
-        match rx.try_recv() {
-            Err(TryRecvError::Disconnected) => {
-                info!("Hue sender disconnected; exiting background task.");
-                return Ok(());
-            }
-            Ok(i) => {
-                info!(
-                    "Connecting to Hue bridge at {} via DTLS (after pre-emptive drain)...",
-                    addr
-                );
-                let socket = UdpSocket::bind("0.0.0.0:0").await?;
-                socket.connect(addr).await?;
-                let dtls_conn =
-                    match DTLSConn::new(Arc::new(socket), config.clone(), true, None).await {
-                        Ok(conn) => conn,
-                        Err(e) => {
-                            error!("DTLS handshake failed: {}. Retrying in 5s...", e);
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            continue;
-                        }
-                    };
-                if let Err(e) =
-                    stream_to_hue_starting_with(dtls_conn, &mappings, &rx, i, &area_id).await
-                {
-                    warn!("Hue streaming error: {}. Reconnecting...", e);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
-                return Ok(());
-            }
-            Err(TryRecvError::Empty) => {}
+        // Use a non-blocking check to see if the channel is disconnected and empty
+        let rx_clone = rx.clone();
+        let is_done = tokio::task::spawn_blocking(move || {
+            // If try_recv returns Disconnected, and the channel is empty, we are done.
+            // We use a small peek here essentially.
+            rx_clone.is_empty()
+                && matches!(
+                    rx_clone.try_recv(),
+                    Err(crossbeam_channel::TryRecvError::Disconnected)
+                )
+        })
+        .await?;
+
+        if is_done {
+            info!("Hue sender disconnected; exiting background task.");
+            return Ok(());
         }
 
         info!("Connecting to Hue bridge at {} via DTLS...", addr);
@@ -225,41 +211,31 @@ async fn stream_to_hue_starting_with(
             return Err(anyhow!("Failed to write to DTLS connection: {}", e));
         }
 
-        // Wait for next frame without blocking the Tokio executor.
         let rx_clone = rx.clone();
         current_intensities = match tokio::task::spawn_blocking(move || rx_clone.recv()).await {
             Ok(Ok(i)) => i,
-            Ok(Err(_)) => return Ok(()), // Channel closed
+            Ok(Err(_)) => return Ok(()),
             Err(e) => return Err(anyhow!("Hue receive task failed: {}", e)),
         };
     }
 }
 
-/// Corrected HueStream binary packet builder per official Hue Entertainment API spec.
 pub fn build_huestream_packet(
     intensities: &[f32],
     mappings: &[HueOutputMapping],
     sequence: u8,
     area_id: &str,
 ) -> Result<Vec<u8>> {
-    // 16 byte header + 36 byte UUID + (7 bytes * channels)
     let mut buf = Vec::with_capacity(16 + 36 + (mappings.len() * 7));
 
-    // 1. Protocol Name (9 bytes)
     buf.extend_from_slice(b"HueStream");
-    // 2. Version 2.0 (2 bytes)
     buf.push(0x02);
     buf.push(0x00);
-    // 3. Sequence ID (1 byte)
     buf.push(sequence);
-    // 4. Reserved (2 bytes)
     buf.extend_from_slice(&[0x00, 0x00]);
-    // 5. Color Space RGB (1 byte)
     buf.push(0x00);
-    // 6. Reserved (1 byte)
     buf.push(0x00);
 
-    // 7. Entertainment Configuration ID (36 bytes)
     let area_bytes = area_id.as_bytes();
     if area_bytes.len() != 36 {
         return Err(anyhow!("Hue area_id must be exactly 36 characters (UUID)"));
@@ -274,7 +250,6 @@ pub fn build_huestream_packet(
     let scale_intensity =
         |intensity: f32| -> u16 { (intensity * 65535.0).clamp(0.0, 65535.0).round() as u16 };
 
-    // 8. Data Slots (7 bytes per channel)
     for (idx, m) in mappings.iter().enumerate() {
         let intensity = intensities.get(idx).cloned().unwrap_or(0.0);
 
@@ -289,9 +264,7 @@ pub fn build_huestream_packet(
             (val, val, val)
         };
 
-        // Channel ID (1 byte)
         buf.push(m.channel_id);
-        // RGB Data (6 bytes, Big Endian)
         buf.write_u16::<BigEndian>(r)?;
         buf.write_u16::<BigEndian>(g)?;
         buf.write_u16::<BigEndian>(b)?;
@@ -325,25 +298,52 @@ mod tests {
 
         let packet = build_huestream_packet(&intensities, &mappings, sequence, area_id).unwrap();
 
-        // Header
         assert_eq!(&packet[0..9], b"HueStream");
-        assert_eq!(packet[9], 0x02); // Version Major
+        assert_eq!(packet[9], 0x02);
         assert_eq!(packet[11], sequence);
-
-        // Area ID
         assert_eq!(&packet[16..52], area_id.as_bytes());
-
-        // Channel 0 (RGB)
-        // Offset 52: Channel ID (0x00)
-        // Offset 53-54: R (65535 -> 0xFFFF)
         assert_eq!(packet[52], 0x00);
         assert_eq!(packet[53], 0xFF);
         assert_eq!(packet[54], 0xFF);
-
-        // Channel 1 (Grayscale)
-        // Offset 52 + 7 = 59
-        // Offset 59: Channel ID (0x01)
         assert_eq!(packet[59], 0x01);
-        assert_eq!(packet[60], 0x80); // 0.5 * 65535 rounded
+        assert_eq!(packet[60], 0x80);
+    }
+
+    #[test]
+    fn test_latest_wins_channel_logic() {
+        use pulseplex_core::DecayProfile;
+        use pulseplex_core::VelocityCurve;
+
+        let mappings = vec![HueOutputMapping {
+            internal_id: 1,
+            channel_id: 0,
+            color: None,
+        }];
+
+        let (tx, rx) = bounded(1);
+        let rx_drain = rx.clone();
+        let mut sink = HueSink {
+            tx,
+            rx_drain,
+            mappings: mappings.clone(),
+            intensity_buffer: vec![0.0],
+        };
+
+        let mut intensities1 = HashMap::new();
+        let mut env1 = DecayEnvelope::new(1.0, VelocityCurve::Linear, DecayProfile::Linear);
+        env1.intensity = 0.1;
+        intensities1.insert(1, env1);
+
+        let mut intensities2 = HashMap::new();
+        let mut env2 = DecayEnvelope::new(1.0, VelocityCurve::Linear, DecayProfile::Linear);
+        env2.intensity = 0.9;
+        intensities2.insert(1, env2);
+
+        sink.send_state(&intensities1).unwrap();
+        sink.send_state(&intensities2).unwrap();
+
+        let received = rx.recv().unwrap();
+        assert_eq!(received[0], 0.9);
+        assert!(rx.is_empty());
     }
 }

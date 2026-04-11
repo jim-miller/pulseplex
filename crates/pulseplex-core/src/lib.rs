@@ -130,11 +130,6 @@ impl PulsePlexEngine {
         }
     }
 
-    /// Replace the current note behaviors with a new set.
-    pub fn set_behaviors(&mut self, behaviors: HashMap<usize, BehaviorConfig>) {
-        self.behaviors = behaviors;
-    }
-
     /// Returns the number of currently active lighting envelopes.
     pub fn active_lights_count(&self) -> usize {
         self.active_lights.len()
