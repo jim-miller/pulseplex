@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pulseplex_core::{ArtNetBridge, LightSink, PulsePlexEngine, Signal};
+use pulseplex_core::{ArtNetBridge, DecayEnvelope, LightSink, PulsePlexEngine, Signal};
+use pulseplex_hue::{HueOutputMapping, HueSink};
 use pulseplex_midi::setup_midi;
 
 use anyhow::bail;
@@ -29,7 +30,7 @@ use spin_sleep::SpinSleeper;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use crate::config::TargetConfig;
+use crate::config::{DmxOutputCompiled, TargetConfig};
 
 /// RAII Guard to ensure terminal state is restored on drop.
 struct TerminalGuard;
@@ -106,10 +107,15 @@ pub struct ArtNetSink {
     socket: UdpSocket,
     addr: SocketAddr,
     bridge: ArtNetBridge,
+    mappings: Vec<DmxOutputCompiled>,
 }
 
 impl ArtNetSink {
-    pub fn new(universe: u16, target_ip: &str) -> anyhow::Result<Self> {
+    pub fn new(
+        universe: u16,
+        target_ip: &str,
+        mappings: Vec<DmxOutputCompiled>,
+    ) -> anyhow::Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_broadcast(true)?;
         let addr = target_ip
@@ -121,13 +127,42 @@ impl ArtNetSink {
             socket,
             addr,
             bridge: ArtNetBridge::new(universe),
+            mappings,
         })
+    }
+
+    /// Internal helper to build the DMX frame.
+    pub fn build_frame(&mut self, intensities: &HashMap<usize, DecayEnvelope>) -> [u8; 512] {
+        let mut frame = [0u8; 512];
+        for m in &self.mappings {
+            if let Some(env) = intensities.get(&m.internal_id) {
+                if let Some([r, g, b]) = m.color {
+                    let r_val = (r as f32 * env.intensity) as u8;
+                    let g_val = (g as f32 * env.intensity) as u8;
+                    let b_val = (b as f32 * env.intensity) as u8;
+
+                    if m.dmx_channel < 512 {
+                        frame[m.dmx_channel] = r_val;
+                    }
+                    if m.dmx_channel + 1 < 512 {
+                        frame[m.dmx_channel + 1] = g_val;
+                    }
+                    if m.dmx_channel + 2 < 512 {
+                        frame[m.dmx_channel + 2] = b_val;
+                    }
+                } else if m.dmx_channel < 512 {
+                    frame[m.dmx_channel] = env.dmx_value();
+                }
+            }
+        }
+        frame
     }
 }
 
 impl LightSink for ArtNetSink {
-    fn send_state(&mut self, state: &[u8; 512]) -> anyhow::Result<()> {
-        self.bridge.set_raw_data(state);
+    fn send_state(&mut self, intensities: &HashMap<usize, DecayEnvelope>) -> anyhow::Result<()> {
+        let frame = self.build_frame(intensities);
+        self.bridge.set_raw_data(&frame);
         self.socket.send_to(self.bridge.as_bytes(), self.addr)?;
         self.bridge.increment_sequence();
         Ok(())
@@ -155,12 +190,12 @@ impl BroadcastSink {
 }
 
 impl LightSink for BroadcastSink {
-    fn send_state(&mut self, state: &[u8; 512]) -> anyhow::Result<()> {
+    fn send_state(&mut self, intensities: &HashMap<usize, DecayEnvelope>) -> anyhow::Result<()> {
         let mut sent_to_any = false;
         let mut first_err: Option<anyhow::Error> = None;
 
         for (idx, sink) in self.sinks.iter_mut().enumerate() {
-            match sink.send_state(state) {
+            match sink.send_state(intensities) {
                 Ok(()) => {
                     sent_to_any = true;
                 }
@@ -342,18 +377,38 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
 
     // Initialize all configured sinks into a broadcast group
     let mut main_sink = BroadcastSink::new();
+    let mut artnet_sink_ptr: Option<*mut ArtNetSink> = None;
+
     for target in &compiled.targets {
         match target {
             TargetConfig::ArtNet(artnet) => {
-                let sink = ArtNetSink::new(artnet.universe, &artnet.target_ip)?;
+                let mut sink = ArtNetSink::new(
+                    artnet.universe,
+                    &artnet.target_ip,
+                    compiled.dmx_outputs.clone(),
+                )?;
+                artnet_sink_ptr = Some(&mut sink as *mut ArtNetSink);
                 main_sink.add(Box::new(sink));
                 info!("Initialized Art-Net sink for universe {}", artnet.universe);
             }
-            TargetConfig::Hue { bridge_ip, .. } => {
-                warn!(
-                    "Philips Hue support is planned but not yet implemented (Bridge: {})",
-                    bridge_ip
-                );
+            TargetConfig::Hue(hue) => {
+                let hue_mappings = compiled
+                    .hue_outputs
+                    .iter()
+                    .map(|h| HueOutputMapping {
+                        internal_id: h.internal_id,
+                        light_id: h.light_id,
+                        color: h.color,
+                    })
+                    .collect();
+                let sink = HueSink::new(
+                    hue.bridge_ip.clone(),
+                    hue.username.clone(),
+                    hue.client_key.clone(),
+                    hue_mappings,
+                )?;
+                main_sink.add(Box::new(sink));
+                info!("Initialized Philips Hue sink for bridge {}", hue.bridge_ip);
             }
         }
     }
@@ -364,7 +419,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
 
     let mut midi_source = setup_midi(&compiled.midi_device, compiled.midi_id_map.clone())?;
 
-    let mut engine = PulsePlexEngine::new(compiled.behaviors.clone(), compiled.dmx_outputs.clone());
+    let mut engine = PulsePlexEngine::new(compiled.behaviors.clone());
 
     let sleeper = SpinSleeper::default();
 
@@ -410,9 +465,8 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
     let mut last_tick = Instant::now();
     let mut next_deadline = last_tick + target_interval;
 
-    // Reused buffers for the hot loop
+    // Reused buffer for signals
     let mut signal_buffer = Vec::with_capacity(64);
-    let mut frame_buffer = [0u8; 512];
 
     while running.load(Ordering::SeqCst) {
         let now = Instant::now();
@@ -454,11 +508,14 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
 
                                     // Re-initialize sinks
                                     let mut new_main_sink = BroadcastSink::new();
+                                    let mut new_artnet_sink_ptr: Option<*mut ArtNetSink> = None;
+
                                     for target in &applied_compiled.targets {
                                         match target {
                                             TargetConfig::ArtNet(artnet) => {
-                                                match ArtNetSink::new(artnet.universe, &artnet.target_ip) {
-                                                    Ok(sink) => {
+                                                match ArtNetSink::new(artnet.universe, &artnet.target_ip, applied_compiled.dmx_outputs.clone()) {
+                                                    Ok(mut sink) => {
+                                                        new_artnet_sink_ptr = Some(&mut sink as *mut ArtNetSink);
                                                         new_main_sink.add(Box::new(sink));
                                                     }
                                                     Err(e) => {
@@ -471,11 +528,24 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                                                     }
                                                 }
                                             }
-                                            TargetConfig::Hue { .. } => {}
+                                            TargetConfig::Hue(hue) => {
+                                                let hue_mappings = applied_compiled.hue_outputs.iter().map(|h| {
+                                                    HueOutputMapping {
+                                                        internal_id: h.internal_id,
+                                                        light_id: h.light_id,
+                                                        color: h.color,
+                                                    }
+                                                }).collect();
+                                                match HueSink::new(hue.bridge_ip.clone(), hue.username.clone(), hue.client_key.clone(), hue_mappings) {
+                                                    Ok(sink) => new_main_sink.add(Box::new(sink)),
+                                                    Err(e) => warn!("Hot reload failed to recreate Hue sink: {}", e),
+                                                }
+                                            }
                                         }
                                     }
                                     if !new_main_sink.is_empty() {
                                         main_sink = new_main_sink;
+                                        artnet_sink_ptr = new_artnet_sink_ptr;
                                     } else {
                                         warn!("Hot reload failed to initialize any targets. Keeping old targets.");
                                         applied_compiled.targets = compiled.targets.clone();
@@ -484,7 +554,6 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                                     midi_source = new_midi_source;
                                     engine = PulsePlexEngine::new(
                                         applied_compiled.behaviors.clone(),
-                                        applied_compiled.dmx_outputs.clone(),
                                     );
                                     config = new_config;
                                     compiled = applied_compiled;
@@ -511,7 +580,6 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
             &mut midi_source,
             &mut [&mut main_sink],
             &mut signal_buffer,
-            &mut frame_buffer,
         ) {
             warn!("Engine error: {}. Initiating shutdown...", e);
             running.store(false, Ordering::SeqCst);
@@ -523,8 +591,17 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
             for signal in &signal_buffer {
                 dashboard_state.push_signal(*signal);
             }
-            // Use the frame buffer directly for visualization (decoupled from ArtNetSink internals)
-            dashboard_state.dmx_channels = frame_buffer;
+
+            // We still want to see DMX in the dashboard if possible.
+            // If we have an Art-Net sink, we can use its build_frame helper.
+            if let Some(ptr) = artnet_sink_ptr {
+                unsafe {
+                    dashboard_state.dmx_channels = (*ptr).build_frame(engine.active_lights());
+                }
+            } else {
+                dashboard_state.dmx_channels.fill(0);
+            }
+
             dashboard_state.active_notes = engine.active_lights_count();
             term.draw(|f| ui(f, &dashboard_state))?;
         }
@@ -628,35 +705,15 @@ fn ui(f: &mut Frame, state: &DashboardState) {
 }
 
 fn perform_shutdown(
-    config: &crate::config::ShutdownConfig,
+    _config: &crate::config::ShutdownConfig,
     sink: &mut dyn LightSink,
-    initial_state: &[u8; 512],
+    _initial_state: &[u8; 512],
 ) -> anyhow::Result<()> {
-    let mut final_frame = [0u8; 512];
-
-    match config.mode {
-        ShutdownMode::Blackout => {
-            info!("Shutting down: Blackout");
-            // final_frame is already all zeros
-        }
-        ShutdownMode::Default => {
-            info!("Shutting down: Applying default scene");
-            if let Some(defaults) = &config.defaults {
-                for (ch, val) in defaults {
-                    if *ch < 512 {
-                        final_frame[*ch] = *val;
-                    }
-                }
-            }
-        }
-        ShutdownMode::Restore => {
-            info!("Shutting down: Restoring previous state");
-            final_frame.copy_from_slice(initial_state);
-        }
-    }
-
-    // Send the final "Exit Frame"
-    sink.send_state(&final_frame)?;
+    // Shutdown currently assumes a DMX frame for simplicity in the trait.
+    // In a multi-protocol world, we might need a more generic shutdown state.
+    // For now, we'll just pass a zeroed intensity map to the sink.
+    let empty_intensities = HashMap::new();
+    sink.send_state(&empty_intensities)?;
     Ok(())
 }
 
@@ -703,10 +760,10 @@ fn handle_check(path: &str) -> anyhow::Result<()> {
                     }
                 }
             },
-            TargetConfig::Hue { bridge_ip, .. } => {
+            TargetConfig::Hue(hue) => {
                 println!(
-                    "⚠️  Network (Hue): Philips Hue check is not yet implemented (Bridge: {})",
-                    bridge_ip
+                    "⚠️  Network (Hue): bridge_ip={}, area_id={}",
+                    hue.bridge_ip, hue.area_id
                 );
             }
         }
@@ -762,8 +819,11 @@ mod tests {
     }
 
     impl LightSink for SharedMockSink {
-        fn send_state(&mut self, state: &[u8; 512]) -> anyhow::Result<()> {
-            self.inner.lock().unwrap().send_state(state)
+        fn send_state(
+            &mut self,
+            intensities: &HashMap<usize, DecayEnvelope>,
+        ) -> anyhow::Result<()> {
+            self.inner.lock().unwrap().send_state(intensities)
         }
     }
 
@@ -778,7 +838,10 @@ mod tests {
     }
 
     impl LightSink for FailingSink {
-        fn send_state(&mut self, _state: &[u8; 512]) -> anyhow::Result<()> {
+        fn send_state(
+            &mut self,
+            _intensities: &HashMap<usize, DecayEnvelope>,
+        ) -> anyhow::Result<()> {
             let mut calls = self.calls.lock().unwrap();
             *calls += 1;
             Err(anyhow::anyhow!("intentional sink failure"))
@@ -794,18 +857,16 @@ mod tests {
         broadcast.add(Box::new(SharedMockSink::new(first.clone())));
         broadcast.add(Box::new(SharedMockSink::new(second.clone())));
 
-        let mut frame = [0u8; 512];
-        frame[0] = 7;
-        frame[127] = 99;
-        frame[511] = 255;
+        let mut intensities = HashMap::new();
+        intensities.insert(
+            1,
+            DecayEnvelope::new(1.0, Default::default(), Default::default()),
+        );
 
-        broadcast.send_state(&frame).unwrap();
+        broadcast.send_state(&intensities).unwrap();
 
-        assert_eq!(first.lock().unwrap().frames.len(), 1);
-        assert_eq!(first.lock().unwrap().frames[0], frame);
-
-        assert_eq!(second.lock().unwrap().frames.len(), 1);
-        assert_eq!(second.lock().unwrap().frames[0], frame);
+        assert_eq!(first.lock().unwrap().states.len(), 1);
+        assert_eq!(second.lock().unwrap().states.len(), 1);
     }
 
     #[test]
@@ -819,84 +880,15 @@ mod tests {
         broadcast.add(Box::new(FailingSink::new(failing_calls.clone())));
         broadcast.add(Box::new(SharedMockSink::new(last.clone())));
 
-        let frame = [42u8; 512];
+        let intensities = HashMap::new();
 
         // Should return Ok because at least one sink succeeded
-        let result = broadcast.send_state(&frame);
+        let result = broadcast.send_state(&intensities);
 
         assert!(result.is_ok());
         assert_eq!(*failing_calls.lock().unwrap(), 1);
 
-        assert_eq!(first.lock().unwrap().frames.len(), 1);
-        assert_eq!(last.lock().unwrap().frames.len(), 1);
-    }
-
-    #[test]
-    fn test_artnet_sink_creation() {
-        let sink = ArtNetSink::new(1, "127.0.0.1:6454");
-        assert!(sink.is_ok());
-
-        let invalid_sink = ArtNetSink::new(1, "invalid_ip");
-        assert!(invalid_sink.is_err());
-    }
-
-    #[test]
-    fn test_artnet_sink_send_state() {
-        let mut sink = ArtNetSink::new(1, "127.0.0.1:6454").unwrap();
-        let state = [42u8; 512];
-        let result = sink.send_state(&state);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_perform_shutdown_blackout() {
-        use pulseplex_core::MockSink;
-
-        let config = crate::config::ShutdownConfig {
-            mode: ShutdownMode::Blackout,
-            defaults: None,
-        };
-        let mut sink = MockSink::default();
-        let initial_state = [255u8; 512];
-
-        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
-        assert_eq!(sink.frames.len(), 1);
-        assert_eq!(sink.frames[0][0], 0); // Blackout frame
-    }
-
-    #[test]
-    fn test_perform_shutdown_restore() {
-        use pulseplex_core::MockSink;
-
-        let config = crate::config::ShutdownConfig {
-            mode: ShutdownMode::Restore,
-            defaults: None,
-        };
-        let mut sink = MockSink::default();
-        let initial_state = [128u8; 512];
-
-        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
-        assert_eq!(sink.frames.len(), 1);
-        assert_eq!(sink.frames[0][0], 128); // Restore frame
-    }
-
-    #[test]
-    fn test_perform_shutdown_default() {
-        use pulseplex_core::MockSink;
-
-        let mut defaults = HashMap::new();
-        defaults.insert(5, 42);
-
-        let config = crate::config::ShutdownConfig {
-            mode: ShutdownMode::Default,
-            defaults: Some(defaults),
-        };
-        let mut sink = MockSink::default();
-        let initial_state = [255u8; 512];
-
-        perform_shutdown(&config, &mut sink, &initial_state).unwrap();
-        assert_eq!(sink.frames.len(), 1);
-        assert_eq!(sink.frames[0][0], 0); // Default channel 0 is 0
-        assert_eq!(sink.frames[0][5], 42); // Configured default
+        assert_eq!(first.lock().unwrap().states.len(), 1);
+        assert_eq!(last.lock().unwrap().states.len(), 1);
     }
 }

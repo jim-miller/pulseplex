@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use anyhow::{bail, Result};
-use pulseplex_core::{BehaviorConfig, DmxOutputConfig};
+use pulseplex_core::BehaviorConfig;
 use serde::Deserialize;
 use toml_edit::{value, DocumentMut};
 
@@ -37,17 +37,8 @@ pub struct BehaviorDefinition {
 pub struct OutputConfig {
     pub artnet: Option<ArtNetConfig>,
     pub dmx: Vec<DmxOutputDefinition>,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum TargetConfig {
-    ArtNet(ArtNetConfig),
-    #[allow(dead_code)]
-    Hue {
-        bridge_ip: String,
-        app_key: String,
-    },
+    #[serde(default)]
+    pub hue: Vec<HueOutputDefinition>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -58,9 +49,31 @@ pub struct DmxOutputDefinition {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+pub struct HueOutputDefinition {
+    pub id: String,
+    pub light_id: u16,
+    pub color: Option<[u8; 3]>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum TargetConfig {
+    ArtNet(ArtNetConfig),
+    Hue(HueConfig),
+}
+
+#[derive(Deserialize, Debug, Clone)]
 pub struct ArtNetConfig {
     pub target_ip: String,
     pub universe: u16,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct HueConfig {
+    pub bridge_ip: String,
+    pub username: String,
+    pub client_key: String,
+    pub area_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -73,6 +86,7 @@ pub enum ShutdownMode {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ShutdownConfig {
     pub mode: ShutdownMode,
+    #[allow(dead_code)]
     pub defaults: Option<HashMap<usize, u8>>,
 }
 
@@ -81,8 +95,23 @@ pub struct CompiledConfig {
     pub midi_device: String,
     pub midi_id_map: HashMap<u8, usize>,
     pub behaviors: HashMap<usize, BehaviorConfig>,
-    pub dmx_outputs: Vec<DmxOutputConfig>,
+    pub dmx_outputs: Vec<DmxOutputCompiled>,
+    pub hue_outputs: Vec<HueOutputCompiled>,
     pub targets: Vec<TargetConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DmxOutputCompiled {
+    pub internal_id: usize,
+    pub dmx_channel: usize,
+    pub color: Option<[u8; 3]>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HueOutputCompiled {
+    pub internal_id: usize,
+    pub light_id: u16,
+    pub color: Option<[u8; 3]>,
 }
 
 impl PulsePlexConfig {
@@ -182,10 +211,28 @@ impl PulsePlexConfig {
                 bail!("DMX output ID '{}' has no defined behavior", d.id);
             }
 
-            dmx_outputs.push(DmxOutputConfig {
+            dmx_outputs.push(DmxOutputCompiled {
                 internal_id,
                 dmx_channel: d.channel,
                 color: d.color,
+            });
+        }
+
+        // 5. Map and validate Hue outputs
+        let mut hue_outputs = Vec::new();
+        for h in &self.output.hue {
+            let internal_id = *id_map
+                .get(&h.id)
+                .ok_or_else(|| anyhow::anyhow!("Hue output maps to undefined ID '{}'", h.id))?;
+
+            if !behaviors.contains_key(&internal_id) {
+                bail!("Hue output ID '{}' has no defined behavior", h.id);
+            }
+
+            hue_outputs.push(HueOutputCompiled {
+                internal_id,
+                light_id: h.light_id,
+                color: h.color,
             });
         }
 
@@ -194,6 +241,7 @@ impl PulsePlexConfig {
             midi_id_map,
             behaviors,
             dmx_outputs,
+            hue_outputs,
             targets: self.targets.clone(),
         })
     }
