@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -288,12 +289,12 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
 
     info!("Starting PulsePlex daemon");
 
-    let mut compiled = config.compile();
+    let mut compiled = config.compile()?;
 
-    let mut artnet_sink = ArtNetSink::new(0, "255.255.255.255:6454")?; // Default legacy target for now
-    let mut midi_source = setup_midi(&compiled.midi_device, compiled.midi_id_map)?;
+    let mut artnet_sink = ArtNetSink::new(compiled.artnet.universe, &compiled.artnet.target_ip)?;
+    let mut midi_source = setup_midi(&compiled.midi_device, compiled.midi_id_map.clone())?;
 
-    let mut engine = PulsePlexEngine::new(compiled.behaviors, compiled.dmx_outputs);
+    let mut engine = PulsePlexEngine::new(compiled.behaviors.clone(), compiled.dmx_outputs.clone());
 
     let sleeper = SpinSleeper::default();
 
@@ -374,12 +375,32 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
             info!("Reloading configuration...");
             match PulsePlexConfig::load(&config_path_str) {
                 Ok(new_config) => {
-                    config = new_config;
-                    compiled = config.compile();
-                    // We can't easily recreate midi_source here without potential dropping issues
-                    // but we can update the engine behaviors and outputs
-                    engine = PulsePlexEngine::new(compiled.behaviors, compiled.dmx_outputs);
-                    info!("Reload successful.");
+                    match new_config.compile() {
+                        Ok(new_compiled) => {
+                            // Update MIDI source with new ID map
+                            match setup_midi(&new_compiled.midi_device, new_compiled.midi_id_map.clone()) {
+                                Ok(new_midi_source) => {
+                                    midi_source = new_midi_source;
+                                    engine = PulsePlexEngine::new(new_compiled.behaviors.clone(), new_compiled.dmx_outputs.clone());
+                                    // Update Art-Net sink if network config changed
+                                    if new_compiled.artnet.target_ip != compiled.artnet.target_ip || new_compiled.artnet.universe != compiled.artnet.universe {
+                                        match ArtNetSink::new(new_compiled.artnet.universe, &new_compiled.artnet.target_ip) {
+                                            Ok(new_sink) => artnet_sink = new_sink,
+                                            Err(e) => warn!("Could not update Art-Net sink: {}. Using old connection.", e),
+                                        }
+                                    }
+                                    config = new_config;
+                                    compiled = new_compiled;
+                                    info!("Reload successful.");
+                                }
+                                Err(e) => warn!("Reload failed: could not recreate MIDI source: {}. Keeping previous configuration.", e),
+                            }
+                        }
+                        Err(e) => warn!(
+                            "Reload failed: compilation error: {}. Keeping previous configuration.",
+                            e
+                        ),
+                    }
                 }
                 Err(e) => {
                     warn!("Reload failed: {}. Keeping previous configuration.", e);
@@ -547,35 +568,49 @@ fn handle_check(path: &str) -> anyhow::Result<()> {
     let config = PulsePlexConfig::load(path)?;
     println!("✅ TOML Structure: Valid");
 
-    // 2. Validate Logical ID chain
-    let mut defined_ids = std::collections::HashSet::new();
-    for b in &config.behavior {
-        defined_ids.insert(&b.id);
-    }
-
-    // Check MIDI mappings
-    for (note, id) in &config.midi.mappings {
-        if !defined_ids.contains(id) {
-            println!("❌ MIDI: Note {} maps to unknown ID '{}'", note, id);
+    // 2. Validate Logical ID chain via Compile
+    match config.compile() {
+        Ok(_) => {
+            println!("✅ 3-Tier Mapping: All logical IDs and behaviors are linked correctly");
+        }
+        Err(e) => {
+            println!("❌ Configuration Error: {}", e);
+            bail!("Configuration check failed.");
         }
     }
 
-    // Check DMX mappings
+    // 3. Test Art-Net Network String
+    match SocketAddr::from_str(&config.output.artnet.target_ip) {
+        Ok(_) => println!("✅ Network: Target IP/Port format is valid"),
+        Err(_) => {
+            if config.output.artnet.target_ip.to_socket_addrs().is_ok() {
+                println!(
+                    "⚠️  Network: '{}' is a valid hostname/shorthand, but not a literal IP",
+                    config.output.artnet.target_ip
+                );
+            } else {
+                println!(
+                    "❌ Network: Invalid target_ip format '{}'",
+                    config.output.artnet.target_ip
+                );
+                bail!("Configuration check failed.");
+            }
+        }
+    }
+
+    // 4. Test DMX Bounds and Overlaps
     let mut used_channels = HashMap::new();
+    let mut errors = false;
     for dmx in &config.output.dmx {
-        if !defined_ids.contains(&dmx.id) {
-            println!("❌ DMX: Target ID '{}' has no defined behavior", dmx.id);
-        }
-
         let span = if dmx.color.is_some() { 3 } else { 1 };
         for offset in 0..span {
             let channel = dmx.channel + offset;
             if channel > 511 {
-                anyhow::bail!(
+                println!(
                     "❌ DMX: ID {} (channel {}) exceeds universe limit (511)",
-                    dmx.id,
-                    channel
+                    dmx.id, channel
                 );
+                errors = true;
             }
             if let Some(other_id) = used_channels.insert(channel, &dmx.id) {
                 warn!(
@@ -586,7 +621,11 @@ fn handle_check(path: &str) -> anyhow::Result<()> {
         }
     }
 
-    println!("✅ 3-Tier Mapping: Logical IDs and DMX bounds valid");
+    if errors {
+        bail!("Configuration check failed due to DMX errors.");
+    }
+
+    println!("✅ DMX Mappings: All channels within 0-511 range");
     info!("Configuration check passed.");
     Ok(())
 }

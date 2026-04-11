@@ -43,6 +43,10 @@ velocity_curve = "hard"
 decay_profile = "linear"
 
 [output]
+[output.artnet]
+target_ip = "255.255.255.255:6454"
+universe = 0
+
 [[output.dmx]]
 id = "kick"
 channel = 0
