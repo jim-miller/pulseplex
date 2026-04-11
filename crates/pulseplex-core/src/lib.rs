@@ -144,18 +144,19 @@ impl PulsePlexEngine {
     }
 
     /// Process a single tick of the orchestration loop.
-    /// Polls the source into the provided buffer, updates envelopes, and pushes to sinks.
+    /// Polls the source into the provided buffer, updates envelopes, builds the DMX frame, and pushes to sinks.
     pub fn process_tick(
         &mut self,
         dt: Duration,
         source: &mut dyn EventSource,
         sinks: &mut [&mut dyn LightSink],
-        buffer: &mut Vec<Signal>,
+        signal_buffer: &mut Vec<Signal>,
+        frame_buffer: &mut [u8; 512],
     ) -> anyhow::Result<()> {
-        buffer.clear();
-        source.poll(buffer)?;
+        signal_buffer.clear();
+        source.poll(signal_buffer)?;
 
-        for signal in buffer.iter() {
+        for signal in signal_buffer.iter() {
             if let Signal::Trigger { id, velocity } = *signal {
                 if let Some(mapping) = self.note_mappings.get(&id) {
                     let mut env = DecayEnvelope::new(
@@ -176,7 +177,7 @@ impl PulsePlexEngine {
         });
 
         // Build DMX frame
-        let mut frame = [0u8; 512];
+        frame_buffer.fill(0);
         for (note, env) in &self.active_lights {
             if let Some(mapping) = self.note_mappings.get(note) {
                 if let Some([r, g, b]) = mapping.color {
@@ -185,23 +186,23 @@ impl PulsePlexEngine {
                     let b_val = (b as f32 * env.intensity) as u8;
 
                     if mapping.dmx_channel < 512 {
-                        frame[mapping.dmx_channel] = r_val;
+                        frame_buffer[mapping.dmx_channel] = r_val;
                     }
                     if mapping.dmx_channel + 1 < 512 {
-                        frame[mapping.dmx_channel + 1] = g_val;
+                        frame_buffer[mapping.dmx_channel + 1] = g_val;
                     }
                     if mapping.dmx_channel + 2 < 512 {
-                        frame[mapping.dmx_channel + 2] = b_val;
+                        frame_buffer[mapping.dmx_channel + 2] = b_val;
                     }
                 } else if mapping.dmx_channel < 512 {
-                    frame[mapping.dmx_channel] = env.dmx_value();
+                    frame_buffer[mapping.dmx_channel] = env.dmx_value();
                 }
             }
         }
 
         // Push to all sinks
         for sink in sinks {
-            sink.send_state(&frame)?;
+            sink.send_state(frame_buffer)?;
         }
 
         Ok(())
@@ -384,7 +385,8 @@ mod tests {
 
         let mut source = MockSource::new(timeline);
         let mut sink = MockSink::default();
-        let mut buffer = Vec::new();
+        let mut signal_buffer = Vec::new();
+        let mut frame_buffer = [0u8; 512];
 
         let mut engine = PulsePlexEngine::new(vec![
             MappingConfig {
@@ -409,7 +411,13 @@ mod tests {
         // Run 5 frames
         for _ in 0..5 {
             engine
-                .process_tick(dt, &mut source, &mut [&mut sink], &mut buffer)
+                .process_tick(
+                    dt,
+                    &mut source,
+                    &mut [&mut sink],
+                    &mut signal_buffer,
+                    &mut frame_buffer,
+                )
                 .unwrap();
         }
 
@@ -454,7 +462,8 @@ mod tests {
             velocity: 127,
         }]];
         let mut source = MockSource::new(timeline);
-        let mut buffer = Vec::new();
+        let mut signal_buffer = Vec::new();
+        let mut frame_buffer = [0u8; 512];
 
         let mut sink1 = MockSink::default();
         let mut sink2 = MockSink::default();
@@ -464,7 +473,8 @@ mod tests {
                 Duration::from_millis(25),
                 &mut source,
                 &mut [&mut sink1, &mut sink2],
-                &mut buffer,
+                &mut signal_buffer,
+                &mut frame_buffer,
             )
             .unwrap();
 
