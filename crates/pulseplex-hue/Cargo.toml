@@ -1,0 +1,15 @@
+[package]
+name = "pulseplex-hue"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+pulseplex-core = { workspace = true }
+anyhow = { workspace = true }
+crossbeam-channel = { workspace = true }
+tracing = { workspace = true }
+tokio = { version = "1.43.0", features = ["full"] }
+webrtc-dtls = "0.10.0"
+byteorder = "1.5.0"
+hex = "0.4.3"

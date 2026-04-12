@@ -16,6 +16,7 @@ edition.workspace = true
 anyhow.workspace = true
 crossbeam-channel.workspace = true
 pulseplex-core.workspace = true
+pulseplex-hue.workspace = true
 tracing.workspace = true
 clap = { version = "4.5", features = ["derive"] }
 pulseplex-midi = { path = "crates/pulseplex-midi" }
@@ -33,6 +34,7 @@ crossterm = "0.28.1"
 
 [workspace.dependencies]
 pulseplex-core = { path = "crates/pulseplex-core" }
+pulseplex-hue = { path = "crates/pulseplex-hue" }
 anyhow = "1.0"
 crossbeam-channel = "0.5.15"
 serde = { version = "1.0.228", features = ["derive"] }

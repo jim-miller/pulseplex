@@ -30,14 +30,6 @@ pub struct BehaviorConfig {
     pub decay_profile: DecayProfile,
 }
 
-/// DMX output mapping for a logical ID.
-#[derive(Debug, Clone, Deserialize)]
-pub struct DmxOutputConfig {
-    pub internal_id: usize,
-    pub dmx_channel: usize,
-    pub color: Option<[u8; 3]>,
-}
-
 /// Generic signals that can drive the lighting engine.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Signal {
@@ -51,8 +43,9 @@ pub enum Signal {
 
 /// Interface for outputting lighting state to hardware or protocols.
 pub trait LightSink: Send {
-    /// Send the complete frame state (512 channels) to the output.
-    fn send_state(&mut self, state: &[u8; 512]) -> anyhow::Result<()>;
+    /// Send the current intensities of all active logical IDs to the output.
+    /// This allows each protocol to map IDs to its own hardware natively.
+    fn send_state(&mut self, intensities: &HashMap<usize, DecayEnvelope>) -> anyhow::Result<()>;
 }
 
 /// Interface for receiving signals from hardware or protocols.
@@ -127,18 +120,13 @@ impl DecayEnvelope {
 pub struct PulsePlexEngine {
     active_lights: HashMap<usize, DecayEnvelope>,
     behaviors: HashMap<usize, BehaviorConfig>,
-    dmx_outputs: Vec<DmxOutputConfig>,
 }
 
 impl PulsePlexEngine {
-    pub fn new(
-        behaviors: HashMap<usize, BehaviorConfig>,
-        dmx_outputs: Vec<DmxOutputConfig>,
-    ) -> Self {
+    pub fn new(behaviors: HashMap<usize, BehaviorConfig>) -> Self {
         Self {
             active_lights: HashMap::new(),
             behaviors,
-            dmx_outputs,
         }
     }
 
@@ -147,15 +135,21 @@ impl PulsePlexEngine {
         self.active_lights.len()
     }
 
+    /// Returns a reference to the currently active lighting envelopes.
+    pub fn active_lights(&self) -> &HashMap<usize, DecayEnvelope> {
+        &self.active_lights
+    }
+
     /// Process a single tick of the orchestration loop.
-    /// Polls the source into the provided buffer, updates envelopes, builds the DMX frame, and pushes to sinks.
+    /// Polls the source into the provided buffer, updates envelopes, and pushes to sinks.
+    ///
+    /// NOTE: This method will .clear() the provided signal_buffer before processing.
     pub fn process_tick(
         &mut self,
         dt: Duration,
         source: &mut dyn EventSource,
         sinks: &mut [&mut dyn LightSink],
         signal_buffer: &mut Vec<Signal>,
-        frame_buffer: &mut [u8; 512],
     ) -> anyhow::Result<()> {
         signal_buffer.clear();
         source.poll(signal_buffer)?;
@@ -180,33 +174,9 @@ impl PulsePlexEngine {
             !env.is_dead()
         });
 
-        // Build DMX frame
-        frame_buffer.fill(0);
-        for dmx_config in &self.dmx_outputs {
-            if let Some(env) = self.active_lights.get(&dmx_config.internal_id) {
-                if let Some([r, g, b]) = dmx_config.color {
-                    let r_val = (r as f32 * env.intensity) as u8;
-                    let g_val = (g as f32 * env.intensity) as u8;
-                    let b_val = (b as f32 * env.intensity) as u8;
-
-                    if dmx_config.dmx_channel < 512 {
-                        frame_buffer[dmx_config.dmx_channel] = r_val;
-                    }
-                    if dmx_config.dmx_channel + 1 < 512 {
-                        frame_buffer[dmx_config.dmx_channel + 1] = g_val;
-                    }
-                    if dmx_config.dmx_channel + 2 < 512 {
-                        frame_buffer[dmx_config.dmx_channel + 2] = b_val;
-                    }
-                } else if dmx_config.dmx_channel < 512 {
-                    frame_buffer[dmx_config.dmx_channel] = env.dmx_value();
-                }
-            }
-        }
-
-        // Push to all sinks
+        // Push to all sinks - Protocol-native routing happens in the sinks.
         for sink in sinks {
-            sink.send_state(frame_buffer)?;
+            sink.send_state(&self.active_lights)?;
         }
 
         Ok(())
@@ -288,12 +258,16 @@ impl ArtNetBridge {
 /// A Mock Sink for testing. Records frames sent to it.
 #[derive(Default)]
 pub struct MockSink {
-    pub frames: Vec<[u8; 512]>,
+    pub states: Vec<HashMap<usize, f32>>,
 }
 
 impl LightSink for MockSink {
-    fn send_state(&mut self, state: &[u8; 512]) -> anyhow::Result<()> {
-        self.frames.push(*state);
+    fn send_state(&mut self, intensities: &HashMap<usize, DecayEnvelope>) -> anyhow::Result<()> {
+        let mut state = HashMap::new();
+        for (&id, env) in intensities {
+            state.insert(id, env.intensity);
+        }
+        self.states.push(state);
         Ok(())
     }
 }
@@ -390,7 +364,6 @@ mod tests {
         let mut source = MockSource::new(timeline);
         let mut sink = MockSink::default();
         let mut signal_buffer = Vec::new();
-        let mut frame_buffer = [0u8; 512];
 
         let mut behaviors = HashMap::new();
         behaviors.insert(
@@ -410,41 +383,22 @@ mod tests {
             },
         );
 
-        let dmx_outputs = vec![
-            DmxOutputConfig {
-                internal_id: 1,
-                dmx_channel: 0,
-                color: None,
-            },
-            DmxOutputConfig {
-                internal_id: 2,
-                dmx_channel: 1,
-                color: None,
-            },
-        ];
-
-        let mut engine = PulsePlexEngine::new(behaviors, dmx_outputs);
+        let mut engine = PulsePlexEngine::new(behaviors);
         let dt = Duration::from_millis(25); // 40Hz
 
         // Run 5 frames
         for _ in 0..5 {
             engine
-                .process_tick(
-                    dt,
-                    &mut source,
-                    &mut [&mut sink],
-                    &mut signal_buffer,
-                    &mut frame_buffer,
-                )
+                .process_tick(dt, &mut source, &mut [&mut sink], &mut signal_buffer)
                 .unwrap();
         }
 
-        // Frame 0: Trigger id:1 at 127. Intensity 1.0 -> 0.75 after tick. DMX ~191
-        assert!(sink.frames[0][0] > 180);
-        // Frame 1: id:1 decays 0.75 -> 0.5. DMX ~127
-        assert!(sink.frames[1][0] > 120);
-        // Frame 3: Trigger id:2 at 64. Intensity ~0.5. Tick: 0.5 -> 0.25. DMX ~63
-        assert!(sink.frames[3][1] > 60 && sink.frames[3][1] < 70);
+        // Frame 0: Trigger id:1 at 127. Intensity 1.0 -> 0.75 after tick.
+        assert!((*sink.states[0].get(&1).unwrap() - 0.75).abs() < 0.01);
+        // Frame 1: id:1 decays 0.75 -> 0.5.
+        assert!((*sink.states[1].get(&1).unwrap() - 0.5).abs() < 0.01);
+        // Frame 3: Trigger id:2 at 64. Intensity ~0.5. Tick: 0.5 -> 0.25.
+        assert!((*sink.states[3].get(&2).unwrap() - 0.25).abs() < 0.01);
     }
 
     #[test]
@@ -475,20 +429,14 @@ mod tests {
                 decay_profile: DecayProfile::Linear,
             },
         );
-        let dmx_outputs = vec![DmxOutputConfig {
-            internal_id: 36,
-            dmx_channel: 0,
-            color: None,
-        }];
 
-        let mut engine = PulsePlexEngine::new(behaviors, dmx_outputs);
+        let mut engine = PulsePlexEngine::new(behaviors);
         let timeline = vec![vec![Signal::Trigger {
             id: 36,
             velocity: 127,
         }]];
         let mut source = MockSource::new(timeline);
         let mut signal_buffer = Vec::new();
-        let mut frame_buffer = [0u8; 512];
 
         let mut sink1 = MockSink::default();
         let mut sink2 = MockSink::default();
@@ -499,13 +447,12 @@ mod tests {
                 &mut source,
                 &mut [&mut sink1, &mut sink2],
                 &mut signal_buffer,
-                &mut frame_buffer,
             )
             .unwrap();
 
-        assert_eq!(sink1.frames.len(), 1);
-        assert_eq!(sink2.frames.len(), 1);
-        assert_eq!(sink1.frames[0][0], sink2.frames[0][0]);
-        assert!(sink1.frames[0][0] > 0);
+        assert_eq!(sink1.states.len(), 1);
+        assert_eq!(sink2.states.len(), 1);
+        assert_eq!(sink1.states[0].get(&36), sink2.states[0].get(&36));
+        assert!(*sink1.states[0].get(&36).unwrap() > 0.0);
     }
 }
