@@ -246,24 +246,58 @@ impl PulsePlexConfig {
     }
 }
 
+pub fn update_hue_ip_in_config(config_path: &str, new_ip: &str) -> Result<()> {
+    let contents = fs::read_to_string(config_path)?;
+    let mut doc = contents
+        .parse::<DocumentMut>()
+        .map_err(|e| anyhow::anyhow!("Failed to parse config for editing: {}", e))?;
+
+    // Find the hue target and update its bridge_ip
+    // Case 1: [[targets]] - Array of Tables
+    if let Some(targets) = doc
+        .get_mut("targets")
+        .and_then(|t| t.as_array_of_tables_mut())
+    {
+        for target in targets.iter_mut() {
+            if target.get("type").and_then(|v| v.as_str()) == Some("hue") {
+                target["bridge_ip"] = value(new_ip);
+            }
+        }
+    }
+    // Case 2: [targets] - Array of Inline Tables (or just an array of values)
+    else if let Some(targets) = doc.get_mut("targets").and_then(|t| t.as_array_mut()) {
+        for target in targets.iter_mut() {
+            if let Some(target_inline) = target.as_inline_table_mut() {
+                if target_inline.get("type").and_then(|v| v.as_str()) == Some("hue") {
+                    target_inline.insert("bridge_ip", value(new_ip).into_value().unwrap());
+                }
+            }
+        }
+    }
+    // Atomic write
+    let path = Path::new(config_path);
+    let tmp_path = path.with_extension("toml.tmp");
+    fs::write(&tmp_path, doc.to_string())?;
+    fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        anyhow::anyhow!("Failed to atomically replace config file: {}", e)
+    })?;
+
+    Ok(())
+}
+
 pub fn update_midi_device_in_config(config_path: &str, new_device: &str) -> Result<()> {
     let contents = fs::read_to_string(config_path)?;
     let mut doc = contents
         .parse::<DocumentMut>()
         .map_err(|e| anyhow::anyhow!("Failed to parse config for editing: {}", e))?;
 
-    // Safely update the value while preserving all surrounding comments and whitespace
     doc["midi"]["device_name"] = value(new_device);
 
-    // Atomic write: Save to a temp file then swap
     let path = Path::new(config_path);
     let tmp_path = path.with_extension("toml.tmp");
-
     fs::write(&tmp_path, doc.to_string())?;
-
-    // Rename guarantees atomicity on POSIX systems if both are on the same filesystem
     fs::rename(&tmp_path, path).map_err(|e| {
-        // Attempt to clean up the temp file if rename fails
         let _ = fs::remove_file(&tmp_path);
         anyhow::anyhow!("Failed to atomically replace config file: {}", e)
     })?;

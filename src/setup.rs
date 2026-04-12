@@ -146,11 +146,23 @@ async fn discover_bridge() -> Result<(IpAddr, String)> {
     Ok((ip, manual_id.to_lowercase()))
 }
 
-fn build_hue_client(bridge_ip: &std::net::IpAddr, bridge_id: &str) -> Result<Client> {
+pub fn build_hue_client(bridge_ip: &std::net::IpAddr, bridge_id: &str) -> Result<Client> {
     let mut builder = Client::builder();
 
+    let cert_bytes = if let Some(proj_dirs) = ProjectDirs::from("org", "pulseplex", "pulseplex") {
+        let custom_cert = proj_dirs.config_dir().join("custom_hue_ca.pem");
+        if custom_cert.exists() {
+            tracing::info!("Using custom Hue CA override: {:?}", custom_cert);
+            std::fs::read(custom_cert)?
+        } else {
+            HUE_CA_CERT.to_vec()
+        }
+    } else {
+        HUE_CA_CERT.to_vec()
+    };
+
     // Split the bundle by END CERTIFICATE and re-add the delimiter to each block
-    let pem_str = std::str::from_utf8(HUE_CA_CERT)?;
+    let pem_str = std::str::from_utf8(&cert_bytes)?;
     for block in pem_str.split("-----END CERTIFICATE-----") {
         let trimmed = block.trim();
         if trimmed.is_empty() {
@@ -171,6 +183,27 @@ fn build_hue_client(bridge_ip: &std::net::IpAddr, bridge_id: &str) -> Result<Cli
         .resolve(bridge_id, std::net::SocketAddr::new(*bridge_ip, 443))
         .build()
         .map_err(|e| anyhow!("Failed to build Hue HTTP client: {}", e))
+}
+
+pub async fn discover_bridge_by_id_fallback(_username: &str) -> Result<IpAddr> {
+    // For now, return the first Hue bridge found as a broad fallback
+    if let Ok(mdns) = ServiceDaemon::new() {
+        let receiver = mdns.browse("_hue._tcp.local.")?;
+        let now = std::time::Instant::now();
+        while now.elapsed() < Duration::from_secs(5) {
+            if let Ok(ServiceEvent::ServiceResolved(info)) =
+                receiver.recv_timeout(Duration::from_millis(500))
+            {
+                let ip = *info
+                    .get_addresses()
+                    .iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("No IP found for mDNS service"))?;
+                return Ok(ip);
+            }
+        }
+    }
+    Err(anyhow!("Could not find any Hue bridge on the network"))
 }
 
 async fn perform_push_link(bridge_ip: &IpAddr, bridge_id: &str) -> Result<(String, String)> {

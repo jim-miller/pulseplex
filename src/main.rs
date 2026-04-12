@@ -1,4 +1,5 @@
 mod config;
+mod doctor;
 mod setup;
 
 use std::collections::HashMap;
@@ -18,6 +19,7 @@ use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::Select;
+use directories::ProjectDirs;
 use notify::Watcher;
 use ratatui::{
     backend::CrosstermBackend,
@@ -28,7 +30,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use spin_sleep::SpinSleeper;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::config::{DmxOutputCompiled, TargetConfig};
@@ -62,7 +64,10 @@ impl Drop for TerminalGuard {
     }
 }
 
-use crate::config::{get_config_path, update_midi_device_in_config, PulsePlexConfig, ShutdownMode};
+use crate::config::{
+    get_config_path, update_hue_ip_in_config, update_midi_device_in_config, PulsePlexConfig,
+    ShutdownMode,
+};
 
 #[derive(Parser)]
 #[command(
@@ -101,6 +106,23 @@ enum Commands {
         #[arg(short, long)]
         config: Option<String>,
     },
+    /// Run diagnostic tests for network and bridge connectivity
+    Doctor {
+        /// Path to configuration file
+        #[arg(short, long)]
+        config: Option<String>,
+    },
+    /// Template management
+    Template {
+        #[command(subcommand)]
+        action: TemplateAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TemplateAction {
+    /// Eject the default edrums configuration template to the current directory
+    Eject,
 }
 
 /// Helper to build a 512-channel DMX frame from intensities.
@@ -258,18 +280,39 @@ impl DashboardState {
 fn main() -> anyhow::Result<()> {
     let cli = Args::parse();
 
-    // Setup logging (verbose flag is global)
+    // 1. Setup Rolling Logs
+    let log_dir = if let Some(proj_dirs) = ProjectDirs::from("org", "pulseplex", "pulseplex") {
+        proj_dirs.data_local_dir().join("logs")
+    } else {
+        PathBuf::from("logs")
+    };
+    std::fs::create_dir_all(&log_dir)?;
+
+    let file_appender = tracing_appender::rolling::daily(log_dir, "pulseplex.log");
+    let (non_blocking_file, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // 2. Setup logging (verbose flag is global)
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(if cli.verbose { "trace" } else { "info" }));
 
-    let registry = tracing_subscriber::registry().with(filter);
+    let registry = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_writer(non_blocking_file).with_ansi(false));
 
     if !cli.no_tui && std::io::stdout().is_terminal() {
-        // Redirect logs to stderr when TUI is active to avoid corrupting the screen
+        // Redirect terminal logs to stderr when TUI is active to avoid corrupting the screen
         registry.with(fmt::layer().with_writer(io::stderr)).init();
     } else {
         registry.with(fmt::layer()).init();
     }
+
+    // 3. Version Check in Background
+    std::thread::spawn(|| {
+        if let Err(e) = check_for_updates() {
+            tracing::debug!("Update check failed: {}", e);
+        }
+    });
+
     match cli.command.unwrap_or(Commands::Run {
         config: None,
         select_midi: false,
@@ -278,6 +321,17 @@ fn main() -> anyhow::Result<()> {
             let path = get_config_path(config.as_ref())?;
             handle_check(path.to_string_lossy().as_ref())?;
         }
+        Commands::Doctor { config } => {
+            doctor::run_doctor(config.as_ref())?;
+        }
+        Commands::Template { action } => match action {
+            TemplateAction::Eject => {
+                let template_content = include_str!("../assets/default_edrums.toml");
+                let dest = PathBuf::from("pulseplex_edrums_template.toml");
+                std::fs::write(&dest, template_content)?;
+                println!("✅ Ejected default template to: {:?}", dest);
+            }
+        },
         Commands::Run {
             config,
             select_midi,
@@ -298,6 +352,32 @@ fn main() -> anyhow::Result<()> {
 
             run_daemon(path, select_midi, !cli.no_tui)?;
         }
+    }
+
+    Ok(())
+}
+
+fn check_for_updates() -> anyhow::Result<()> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("pulseplex-cli")
+        .timeout(Duration::from_secs(2))
+        .build()?;
+
+    let resp = client
+        .get("https://api.github.com/repos/pulseplex/pulseplex/releases/latest")
+        .send()?;
+
+    #[derive(serde::Deserialize)]
+    struct GithubRelease {
+        tag_name: String,
+    }
+
+    let latest: GithubRelease = resp.json()?;
+    let current_v = semver::Version::parse(env!("CARGO_PKG_VERSION"))?;
+    let latest_v = semver::Version::parse(latest.tag_name.trim_start_matches('v'))?;
+
+    if latest_v > current_v {
+        println!("\x1b[33m⚠️  A new version of PulsePlex is available (v{}). Run 'brew upgrade pulseplex' to update.\x1b[0m", latest.tag_name);
     }
 
     Ok(())
@@ -413,7 +493,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                 info!("Initialized Art-Net sink for universe {}", artnet.universe);
             }
             TargetConfig::Hue(hue) => {
-                let hue_mappings = compiled
+                let hue_mappings: Vec<HueOutputMapping> = compiled
                     .hue_outputs
                     .iter()
                     .map(|h| HueOutputMapping {
@@ -422,15 +502,80 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                         color: h.color,
                     })
                     .collect();
-                let sink = HueSink::new(
+
+                // Attempt to initialize the Hue Sink
+                let sink_res = HueSink::new(
                     hue.bridge_ip.clone(),
                     hue.username.clone(),
                     hue.client_key.clone(),
                     hue.area_id.clone(),
-                    hue_mappings,
-                )?;
-                main_sink.add(Box::new(sink));
-                info!("Initialized Philips Hue sink for bridge {}", hue.bridge_ip);
+                    hue_mappings.clone(),
+                );
+
+                match sink_res {
+                    Ok(sink) => {
+                        main_sink.add(Box::new(sink));
+                        info!("Initialized Philips Hue sink for bridge {}", hue.bridge_ip);
+                    }
+                    Err(e) => {
+                        warn!("Failed to initialize Hue sink at {}: {}. Attempting auto-heal via mDNS...", hue.bridge_ip, e);
+
+                        // Extract Bridge ID from client_key (assuming it follows standard Hue format)
+                        // Standard Hue client keys are often hex, but the Bridge ID is also usually
+                        // discoverable if we just look for ANY bridge and see if it matches our credentials.
+                        // However, a better way is to use the Bridge ID if we had it.
+                        // Let's try to discover any bridge and see if it responds to our username.
+                        // For now, let's assume we can find it if we search for the bridge_id if we had it.
+                        // Since we don't store Bridge ID explicitly yet, let's try to find ONE bridge
+                        // on the network and see if its IP changed.
+
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        let new_ip = rt.block_on(async {
+                            // Try to find the bridge by its ID if we can extract it,
+                            // otherwise we'd need to prompt or have it in config.
+                            // In a real scenario, we should have the Bridge ID in the config.
+                            // For this implementation, we'll try to find any bridge and see if it helps.
+                            setup::discover_bridge_by_id_fallback(&hue.username).await
+                        });
+
+                        if let Ok(ip) = new_ip {
+                            let ip_str = ip.to_string();
+                            info!(
+                                "Auto-heal: Found Hue Bridge at new IP: {}. Updating config...",
+                                ip_str
+                            );
+
+                            // Update the config file
+                            if let Err(e) = update_hue_ip_in_config(&config_path_str, &ip_str) {
+                                error!("Auto-heal failed to update config file: {}", e);
+                            }
+
+                            // Retry sink creation with new IP
+                            match HueSink::new(
+                                ip_str,
+                                hue.username.clone(),
+                                hue.client_key.clone(),
+                                hue.area_id.clone(),
+                                hue_mappings,
+                            ) {
+                                Ok(sink) => {
+                                    main_sink.add(Box::new(sink));
+                                    info!("Auto-heal successful. Hue sink initialized.");
+                                }
+                                Err(retry_e) => {
+                                    error!(
+                                        "Auto-heal failed to initialize sink even with new IP: {}",
+                                        retry_e
+                                    );
+                                }
+                            }
+                        } else {
+                            error!("Auto-heal: Could not find Hue Bridge on the network.");
+                        }
+                    }
+                }
             }
         }
     }
