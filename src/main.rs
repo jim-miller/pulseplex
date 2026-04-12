@@ -99,6 +99,10 @@ enum Commands {
         /// Force the interactive MIDI device selection prompt
         #[arg(short, long)]
         select_midi: bool,
+
+        /// Force the first-run setup wizard
+        #[arg(short, long)]
+        setup: bool,
     },
     /// Validate the configuration file and check for DMX collisions
     Check {
@@ -316,6 +320,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command.unwrap_or(Commands::Run {
         config: None,
         select_midi: false,
+        setup: false,
     }) {
         Commands::Check { config } => {
             let path = get_config_path(config.as_ref())?;
@@ -335,11 +340,12 @@ fn main() -> anyhow::Result<()> {
         Commands::Run {
             config,
             select_midi,
+            setup,
         } => {
             let path = get_config_path(config.as_ref())?;
 
-            let path = if !path.exists() && config.is_none() {
-                // If default config doesn't exist, run the setup wizard
+            let path = if setup || (!path.exists() && config.is_none()) {
+                // If default config doesn't exist or --setup is forced, run the wizard
                 setup::run_wizard().context("Failed to complete setup wizard")?
             } else {
                 path

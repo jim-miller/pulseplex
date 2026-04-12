@@ -103,12 +103,21 @@ async fn discover_bridge() -> Result<(IpAddr, String)> {
                     .iter()
                     .next()
                     .ok_or_else(|| anyhow!("No IP found for mDNS service"))?;
-                let bridge_id = info
-                    .get_fullname()
-                    .split('.')
-                    .next()
-                    .unwrap_or("")
-                    .to_lowercase();
+
+                // Try to get bridgeid from TXT records first
+                let bridge_id = match info.get_property_val("bridgeid") {
+                    Some(Some(id_bytes)) => String::from_utf8_lossy(id_bytes).to_lowercase(),
+                    _ => {
+                        // Fallback to name-based extraction but sanitize it
+                        info.get_fullname()
+                            .split('.')
+                            .next()
+                            .unwrap_or("")
+                            .replace(' ', "-")
+                            .to_lowercase()
+                    }
+                };
+
                 return Ok((ip, bridge_id));
             }
         }

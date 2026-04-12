@@ -14,6 +14,9 @@ pub fn run_doctor(config_override: Option<&String>) -> Result<()> {
 
     if !path.exists() {
         println!("- **Status:** ❌ File not found");
+        println!(
+            "\n💡 Tip: Run `pulseplex` without any arguments to start the First-Run Setup Wizard."
+        );
         return Ok(());
     }
 
