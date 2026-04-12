@@ -271,27 +271,19 @@ pub fn update_midi_device_in_config(config_path: &str, new_device: &str) -> Resu
     Ok(())
 }
 
-pub fn get_config_path(cli_override: Option<&String>) -> Result<PathBuf> {
-    cli_override
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var("PULSEPLEX_CONFIG_HOME")
-                .ok()
-                .map(|p| PathBuf::from(p).join("pulseplex.toml"))
-        })
-        .map(Ok)
-        .unwrap_or_else(|| {
-            let xdg_base = env::var("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .or_else(|_| {
-                    env::var("HOME")
-                        .or_else(|_| env::var("USERPROFILE"))
-                        .map(|h| PathBuf::from(h).join(".config"))
-                })
-                .map_err(|_| {
-                    anyhow::anyhow!("Could not determine home directory from HOME or USERPROFILE")
-                })?;
+use directories::ProjectDirs;
 
-            Ok(xdg_base.join("pulseplex").join("pulseplex.toml"))
-        })
+pub fn get_config_path(cli_override: Option<&String>) -> Result<PathBuf> {
+    if let Some(path) = cli_override {
+        return Ok(PathBuf::from(path));
+    }
+
+    if let Ok(path) = env::var("PULSEPLEX_CONFIG_HOME") {
+        return Ok(PathBuf::from(path).join("pulseplex.toml"));
+    }
+
+    let proj_dirs = ProjectDirs::from("org", "pulseplex", "pulseplex")
+        .ok_or_else(|| anyhow::anyhow!("Could not determine configuration directory"))?;
+
+    Ok(proj_dirs.config_dir().join("pulseplex.toml"))
 }

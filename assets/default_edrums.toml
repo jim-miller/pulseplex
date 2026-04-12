@@ -1,0 +1,50 @@
+# PulsePlex Default Configuration
+# Target: Philips Hue Bridge
+# Use 'pulseplex run --select-midi' to pick your hardware.
+
+[midi]
+device_name = "{midi_device}"
+mappings = { 38 = "snare", 36 = "kick", 46 = "hihat_open", 42 = "hihat_closed" }
+
+[[behavior]]
+id = "snare"
+decay_seconds = 0.25
+velocity_curve = "exp"
+decay_profile = "linear"
+
+[[behavior]]
+id = "kick"
+decay_seconds = 0.35
+velocity_curve = "linear"
+decay_profile = "linear"
+
+[[behavior]]
+id = "hihat_open"
+decay_seconds = 0.5
+velocity_curve = "linear"
+decay_profile = "linear"
+
+[[behavior]]
+id = "hihat_closed"
+decay_seconds = 0.05
+velocity_curve = "linear"
+decay_profile = "linear"
+
+[output]
+dmx = []
+hue = [
+    { id = "snare", channel_id = 1, color = [255, 0, 0] },
+    { id = "kick", channel_id = 2, color = [0, 0, 255] },
+    { id = "hihat_open", channel_id = 3, color = [255, 255, 0] },
+    { id = "hihat_closed", channel_id = 4, color = [255, 255, 255] }
+]
+
+[[targets]]
+type = "hue"
+bridge_ip = "{bridge_ip}"
+username = "{username}"
+client_key = "{client_key}"
+area_id = "{area_id}"
+
+[shutdown]
+mode = "blackout"

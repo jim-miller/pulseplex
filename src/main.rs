@@ -1,4 +1,5 @@
 mod config;
+mod setup;
 
 use std::collections::HashMap;
 use std::io::{self, IsTerminal};
@@ -282,6 +283,13 @@ fn main() -> anyhow::Result<()> {
             select_midi,
         } => {
             let path = get_config_path(config.as_ref())?;
+
+            let path = if !path.exists() && config.is_none() {
+                // If default config doesn't exist, run the setup wizard
+                setup::run_wizard()?
+            } else {
+                path
+            };
 
             // Ensure the configuration directory exists
             if let Some(parent) = path.parent() {
