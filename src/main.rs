@@ -101,7 +101,7 @@ enum Commands {
         select_midi: bool,
 
         /// Force the first-run setup wizard
-        #[arg(short, long)]
+        #[arg(long)]
         setup: bool,
     },
     /// Validate the configuration file and check for DMX collisions

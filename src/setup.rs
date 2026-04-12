@@ -1,5 +1,6 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -36,6 +37,101 @@ struct HueAuthSuccess {
 #[derive(Debug, Deserialize)]
 struct HueAuthError {
     description: String,
+}
+
+/// A custom certificate verifier that allows for Hue Bridge's long-lived certificates
+/// which sometimes exceed the maximum allowed validity period in standard webpki.
+#[derive(Debug)]
+struct HueCertVerifier {
+    roots: rustls::RootCertStore,
+}
+
+impl rustls::client::danger::ServerCertVerifier for HueCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls_pki_types::CertificateDer<'_>,
+        intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        server_name: &rustls_pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(self.roots.clone()))
+            .build()
+            .map_err(|e| rustls::Error::General(format!("Verifier build error: {}", e)))?;
+
+        match verifier.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Ok(verified) => Ok(verified),
+            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidYet))
+            | Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Expired))
+            | Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(_))) => {
+                // Return Success for validity errors to bypass Hue's long-lived cert issue
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .mapping
+            .iter()
+            .find(|(scheme, _)| *scheme == dss.scheme)
+            .ok_or_else(|| {
+                rustls::Error::PeerMisbehaved(
+                    rustls::PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme,
+                )
+            })?
+            .1
+            .iter()
+            .find_map(|algo| algo.verify_signature(message, cert, dss.signature()).ok())
+            .map(|_| rustls::client::danger::HandshakeSignatureValid::assertion())
+            .ok_or(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadSignature,
+            ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .mapping
+            .iter()
+            .find(|(scheme, _)| *scheme == dss.scheme)
+            .ok_or_else(|| {
+                rustls::Error::PeerMisbehaved(
+                    rustls::PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme,
+                )
+            })?
+            .1
+            .iter()
+            .find_map(|algo| algo.verify_signature(message, cert, dss.signature()).ok())
+            .map(|_| rustls::client::danger::HandshakeSignatureValid::assertion())
+            .ok_or(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadSignature,
+            ))
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 pub fn run_wizard() -> Result<PathBuf> {
@@ -117,7 +213,6 @@ async fn discover_bridge() -> Result<(IpAddr, String)> {
                             .to_lowercase()
                     }
                 };
-
                 return Ok((ip, bridge_id));
             }
         }
@@ -156,8 +251,6 @@ async fn discover_bridge() -> Result<(IpAddr, String)> {
 }
 
 pub fn build_hue_client(bridge_ip: &std::net::IpAddr, bridge_id: &str) -> Result<Client> {
-    let mut builder = Client::builder();
-
     let cert_bytes = if let Some(proj_dirs) = ProjectDirs::from("org", "pulseplex", "pulseplex") {
         let custom_cert = proj_dirs.config_dir().join("custom_hue_ca.pem");
         if custom_cert.exists() {
@@ -170,7 +263,7 @@ pub fn build_hue_client(bridge_ip: &std::net::IpAddr, bridge_id: &str) -> Result
         HUE_CA_CERT.to_vec()
     };
 
-    // Split the bundle by END CERTIFICATE and re-add the delimiter to each block
+    let mut root_store = rustls::RootCertStore::empty();
     let pem_str = std::str::from_utf8(&cert_bytes)?;
     for block in pem_str.split("-----END CERTIFICATE-----") {
         let trimmed = block.trim();
@@ -178,18 +271,23 @@ pub fn build_hue_client(bridge_ip: &std::net::IpAddr, bridge_id: &str) -> Result
             continue;
         }
         let cert_pem = format!("{}\n-----END CERTIFICATE-----", trimmed);
-        match reqwest::Certificate::from_pem(cert_pem.as_bytes()) {
-            Ok(cert) => {
-                builder = builder.add_root_certificate(cert);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to parse a certificate from bundle: {}", e);
-            }
+        let mut reader = std::io::Cursor::new(cert_pem.as_bytes());
+        for cert in rustls_pemfile::certs(&mut reader) {
+            root_store.add(cert?)?;
         }
     }
 
+    let verifier = HueCertVerifier { roots: root_store };
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+
+    let builder = Client::builder()
+        .use_preconfigured_tls(config)
+        .resolve(bridge_id, std::net::SocketAddr::new(*bridge_ip, 443));
+
     builder
-        .resolve(bridge_id, std::net::SocketAddr::new(*bridge_ip, 443))
         .build()
         .map_err(|e| anyhow!("Failed to build Hue HTTP client: {}", e))
 }

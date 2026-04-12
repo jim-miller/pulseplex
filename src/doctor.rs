@@ -105,7 +105,7 @@ async fn check_hue_connectivity(bridge_ip: &str) -> Result<()> {
         .timeout(Duration::from_secs(2))
         .build()?;
 
-    let url = format!("http://{}/description.xml", bridge_ip);
+    let url = format!("https://{}/description.xml", bridge_ip);
     client.get(url).send().await?;
     Ok(())
 }
