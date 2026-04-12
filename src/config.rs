@@ -282,6 +282,12 @@ pub fn get_config_path(cli_override: Option<&String>) -> Result<PathBuf> {
         return Ok(PathBuf::from(path).join("pulseplex.toml"));
     }
 
+    // Check current directory first
+    let local_config = PathBuf::from("pulseplex.toml");
+    if local_config.exists() {
+        return Ok(local_config);
+    }
+
     let proj_dirs = ProjectDirs::from("org", "pulseplex", "pulseplex")
         .ok_or_else(|| anyhow::anyhow!("Could not determine configuration directory"))?;
 

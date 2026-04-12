@@ -14,7 +14,7 @@ use pulseplex_core::{ArtNetBridge, DecayEnvelope, LightSink, PulsePlexEngine, Si
 use pulseplex_hue::{HueOutputMapping, HueSink};
 use pulseplex_midi::setup_midi;
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::Select;
@@ -286,7 +286,7 @@ fn main() -> anyhow::Result<()> {
 
             let path = if !path.exists() && config.is_none() {
                 // If default config doesn't exist, run the setup wizard
-                setup::run_wizard()?
+                setup::run_wizard().context("Failed to complete setup wizard")?
             } else {
                 path
             };

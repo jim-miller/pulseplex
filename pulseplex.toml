@@ -10,7 +10,7 @@ mode = "Restore"
 
 [midi]
 # Leave device_name blank to force selection at startup
-device_name = ""
+device_name = "Impact GXP49 MIDI1"
 
 [midi.mappings]
 "36" = "kick"

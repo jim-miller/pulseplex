@@ -146,15 +146,38 @@ async fn discover_bridge() -> Result<(IpAddr, String)> {
     Ok((ip, manual_id.to_lowercase()))
 }
 
+fn build_hue_client(bridge_ip: &std::net::IpAddr, bridge_id: &str) -> Result<Client> {
+    let mut builder = Client::builder();
+
+    // Split the bundle by END CERTIFICATE and re-add the delimiter to each block
+    let pem_str = std::str::from_utf8(HUE_CA_CERT)?;
+    for block in pem_str.split("-----END CERTIFICATE-----") {
+        let trimmed = block.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let cert_pem = format!("{}\n-----END CERTIFICATE-----", trimmed);
+        match reqwest::Certificate::from_pem(cert_pem.as_bytes()) {
+            Ok(cert) => {
+                builder = builder.add_root_certificate(cert);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to parse a certificate from bundle: {}", e);
+            }
+        }
+    }
+
+    builder
+        .resolve(bridge_id, std::net::SocketAddr::new(*bridge_ip, 443))
+        .build()
+        .map_err(|e| anyhow!("Failed to build Hue HTTP client: {}", e))
+}
+
 async fn perform_push_link(bridge_ip: &IpAddr, bridge_id: &str) -> Result<(String, String)> {
     println!("\nStep 2: Linking with Bridge");
     println!("Please press the physical button on the center of your Hue Bridge now...");
 
-    let cert = reqwest::Certificate::from_pem(HUE_CA_CERT)?;
-    let client = Client::builder()
-        .add_root_certificate(cert)
-        .resolve(bridge_id, std::net::SocketAddr::new(*bridge_ip, 443))
-        .build()?;
+    let client = build_hue_client(bridge_ip, bridge_id)?;
 
     let url = format!("https://{}/api", bridge_id);
     let body = json!({
@@ -187,11 +210,7 @@ async fn select_entertainment_area(
 ) -> Result<String> {
     println!("\nStep 3: Selecting Entertainment Area");
 
-    let cert = reqwest::Certificate::from_pem(HUE_CA_CERT)?;
-    let client = Client::builder()
-        .add_root_certificate(cert)
-        .resolve(bridge_id, std::net::SocketAddr::new(*bridge_ip, 443))
-        .build()?;
+    let client = build_hue_client(bridge_ip, bridge_id)?;
 
     // Fetch Entertainment Areas using CLIP V2
     let url = format!(
@@ -237,4 +256,27 @@ async fn select_entertainment_area(
         .interact()?;
 
     Ok(v2_resp.data[selection].id.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ca_bundle_parsing() {
+        // Just verify we can parse at least one certificate from the bundle
+        let pem_str = std::str::from_utf8(HUE_CA_CERT).unwrap();
+        let mut count = 0;
+        for block in pem_str.split("-----END CERTIFICATE-----") {
+            let trimmed = block.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let cert_pem = format!("{}\n-----END CERTIFICATE-----", trimmed);
+            if reqwest::Certificate::from_pem(cert_pem.as_bytes()).is_ok() {
+                count += 1;
+            }
+        }
+        assert!(count >= 1, "Should parse at least one Hue CA certificate");
+    }
 }
