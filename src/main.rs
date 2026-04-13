@@ -912,8 +912,7 @@ fn perform_shutdown(
                         // For RGB, check all 3 channels and derive max intensity relative to base color
                         for (offset, &base_val) in base_color.iter().enumerate() {
                             if base_val > 0 {
-                                if let Some(&default_val) = defaults.get(&(m.channel + offset))
-                                {
+                                if let Some(&default_val) = defaults.get(&(m.channel + offset)) {
                                     let intensity = default_val as f32 / base_val as f32;
                                     max_intensity = max_intensity.max(intensity);
                                 }
@@ -1173,14 +1172,12 @@ mod tests {
         let mappings = vec![
             DmxOutputCompiled {
                 internal_id: 1,
-                channel
-: 0,
+                channel: 0,
                 color: None,
             },
             DmxOutputCompiled {
                 internal_id: 2,
-                channel
-: 5,
+                channel: 5,
                 color: Some([255, 128, 0]),
             },
         ];
@@ -1212,14 +1209,12 @@ mod tests {
         let dmx_outputs = vec![
             DmxOutputCompiled {
                 internal_id: 100,
-                channel
-: 0,
+                channel: 0,
                 color: None,
             },
             DmxOutputCompiled {
                 internal_id: 101,
-                channel
-: 10,
+                channel: 10,
                 color: Some([200, 0, 0]),
             },
         ];
@@ -1259,14 +1254,12 @@ mod tests {
         let dmx_outputs = vec![
             DmxOutputCompiled {
                 internal_id: 200,
-                channel
-: 5,
+                channel: 5,
                 color: None,
             },
             DmxOutputCompiled {
                 internal_id: 201,
-                channel
-: 10,
+                channel: 10,
                 color: Some([0, 255, 0]),
             },
         ];

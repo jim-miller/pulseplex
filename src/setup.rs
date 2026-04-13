@@ -88,10 +88,10 @@ impl ServerCertVerifier for HueCertVerifier {
 
                 // Robustly catch Expired, NotValidYet, and all variations of SAN/CN Name Mismatches.
                 //
-                // SECURITY NOTE: While we ignore name mismatches, we STILL validate the certificate 
-                // signature against the Hue Root CA (self.inner does this). This ensures we only 
-                // talk to authentic Philips Hue hardware. We must ignore name mismatches because 
-                // Hue Bridges list their ID in the Common Name (CN) field but lack Subject 
+                // SECURITY NOTE: While we ignore name mismatches, we STILL validate the certificate
+                // signature against the Hue Root CA (self.inner does this). This ensures we only
+                // talk to authentic Philips Hue hardware. We must ignore name mismatches because
+                // Hue Bridges list their ID in the Common Name (CN) field but lack Subject
                 // Alternative Name (SAN) extensions, which modern webpki/rustls strictly requires.
                 if err_msg.contains("expired")
                     || err_msg.contains("not valid yet")
@@ -317,7 +317,10 @@ async fn perform_push_link(bridge_ip: &IpAddr, bridge_id: &str) -> Result<(Strin
             .await
             .context("Failed to send push-link request")?;
 
-        let results: Vec<HueAuthResponse> = resp.json().await.context("Failed to parse Hue Auth response")?;
+        let results: Vec<HueAuthResponse> = resp
+            .json()
+            .await
+            .context("Failed to parse Hue Auth response")?;
         if let Some(res) = results.first() {
             if let Some(success) = &res.success {
                 return Ok((success.username.clone(), success.clientkey.clone()));

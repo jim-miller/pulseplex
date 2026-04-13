@@ -135,25 +135,34 @@ impl PulsePlexConfig {
 
         for (midi_note, behavior_id) in &self.midi.mappings {
             if !behavior_ids.contains(behavior_id.as_str()) {
-                bail!("MIDI mapping for note {} points to non-existent behavior '{}'", midi_note, behavior_id);
+                bail!(
+                    "MIDI mapping for note {} points to non-existent behavior '{}'",
+                    midi_note,
+                    behavior_id
+                );
             }
 
-            let internal_id = *id_to_internal.entry(behavior_id.clone()).or_insert_with(|| {
-                let id = next_internal_id;
-                next_internal_id += 1;
-                id
-            });
+            let internal_id = *id_to_internal
+                .entry(behavior_id.clone())
+                .or_insert_with(|| {
+                    let id = next_internal_id;
+                    next_internal_id += 1;
+                    id
+                });
 
             midi_id_map.insert(*midi_note, internal_id);
         }
 
         for b in &self.behavior {
             if let Some(internal_id) = id_to_internal.get(&b.id) {
-                behaviors.insert(*internal_id, BehaviorConfig {
-                    decay_seconds: b.decay_seconds,
-                    velocity_curve: b.velocity_curve,
-                    decay_profile: b.decay_profile,
-                });
+                behaviors.insert(
+                    *internal_id,
+                    BehaviorConfig {
+                        decay_seconds: b.decay_seconds,
+                        velocity_curve: b.velocity_curve,
+                        decay_profile: b.decay_profile,
+                    },
+                );
             }
         }
 

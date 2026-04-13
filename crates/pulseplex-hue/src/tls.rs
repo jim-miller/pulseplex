@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+use std::sync::Arc;
 
 const HUE_CA_CERT: &[u8] = include_bytes!("../assets/hue_ca_bundle.pem");
 
@@ -57,10 +57,10 @@ impl ServerCertVerifier for HueCertVerifier {
 
                 // Robustly catch Expired, NotValidYet, and all variations of SAN/CN Name Mismatches.
                 //
-                // SECURITY NOTE: While we ignore name mismatches, we STILL validate the certificate 
-                // signature against the Hue Root CA (self.inner does this). This ensures we only 
-                // talk to authentic Philips Hue hardware. We must ignore name mismatches because 
-                // Hue Bridges list their ID in the Common Name (CN) field but lack Subject 
+                // SECURITY NOTE: While we ignore name mismatches, we STILL validate the certificate
+                // signature against the Hue Root CA (self.inner does this). This ensures we only
+                // talk to authentic Philips Hue hardware. We must ignore name mismatches because
+                // Hue Bridges list their ID in the Common Name (CN) field but lack Subject
                 // Alternative Name (SAN) extensions, which modern webpki/rustls strictly requires.
                 if err_msg.contains("expired")
                     || err_msg.contains("not valid yet")
