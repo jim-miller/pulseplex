@@ -103,14 +103,14 @@ pub struct CompiledConfig {
     pub targets: Vec<TargetConfig>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DmxOutputCompiled {
     pub internal_id: usize,
-    pub dmx_channel: usize,
+    pub channel: usize,
     pub color: Option<[u8; 3]>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HueOutputCompiled {
     pub internal_id: usize,
     pub channel_id: u8,
@@ -119,124 +119,64 @@ pub struct HueOutputCompiled {
 
 impl PulsePlexConfig {
     pub fn load(path: &str) -> Result<Self> {
-        let contents = fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("Failed to read config file {}: {}", path, e))?;
-        let mut config: PulsePlexConfig = toml::from_str(&contents)
-            .map_err(|e| anyhow::anyhow!("Failed to parse TOML: {}", e))?;
-
-        // Migration: Move legacy artnet config to targets, but avoid duplicating
-        // an equivalent Art-Net target when both formats are present.
-        if let Some(artnet) = config.output.artnet.take() {
-            let already_present = config.targets.iter().any(|target| {
-                matches!(
-                    target,
-                    TargetConfig::ArtNet(existing)
-                        if existing.target_ip == artnet.target_ip
-                            && existing.universe == artnet.universe
-                )
-            });
-
-            if !already_present {
-                config.targets.push(TargetConfig::ArtNet(artnet));
-            }
-        }
-
+        let content = fs::read_to_string(path)?;
+        let config: Self = toml::from_str(&content)?;
         Ok(config)
     }
 
-    /// Compiles the logical configuration into a high-performance internal representation.
-    /// Returns an error if the logical chain is broken (orphaned IDs, missing behaviors, etc).
     pub fn compile(&self) -> Result<CompiledConfig> {
-        // 1. Gather all unique logical IDs from behaviors and sort them for deterministic internal-ID assignment
-        let mut all_ids: HashSet<&String> = HashSet::new();
-        for b in &self.behavior {
-            all_ids.insert(&b.id);
-        }
-
-        let mut sorted_ids: Vec<&String> = all_ids.into_iter().collect();
-        sorted_ids.sort();
-
-        let id_map: HashMap<String, usize> = sorted_ids
-            .into_iter()
-            .enumerate()
-            .map(|(i, name)| (name.clone(), i))
-            .collect();
-
-        // 2. Map behaviors and validate uniqueness
-        let mut behaviors = HashMap::new();
-        for b in &self.behavior {
-            let internal_id = *id_map.get(&b.id).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Behavior ID '{}' was not assigned an internal ID during config compilation",
-                    b.id
-                )
-            })?;
-            if behaviors
-                .insert(
-                    internal_id,
-                    BehaviorConfig {
-                        decay_seconds: b.decay_seconds,
-                        velocity_curve: b.velocity_curve,
-                        decay_profile: b.decay_profile,
-                    },
-                )
-                .is_some()
-            {
-                bail!("Duplicate behavior ID defined: '{}'", b.id);
-            }
-        }
-
-        // 3. Map and validate MIDI inputs
         let mut midi_id_map = HashMap::new();
-        for (note, logical_id) in &self.midi.mappings {
-            let internal_id = *id_map.get(logical_id).ok_or_else(|| {
-                anyhow::anyhow!("MIDI note {} maps to undefined ID '{}'", note, logical_id)
-            })?;
+        let mut behaviors = HashMap::new();
+        let mut id_to_internal = HashMap::new();
+        let mut next_internal_id = 0;
 
-            if !behaviors.contains_key(&internal_id) {
-                bail!(
-                    "MIDI note {} maps to ID '{}' which has no defined behavior",
-                    note,
-                    logical_id
-                );
+        // Verify all mappings point to existing behaviors
+        let behavior_ids: HashSet<_> = self.behavior.iter().map(|b| b.id.as_str()).collect();
+
+        for (midi_note, behavior_id) in &self.midi.mappings {
+            if !behavior_ids.contains(behavior_id.as_str()) {
+                bail!("MIDI mapping for note {} points to non-existent behavior '{}'", midi_note, behavior_id);
             }
-            midi_id_map.insert(*note, internal_id);
+
+            let internal_id = *id_to_internal.entry(behavior_id.clone()).or_insert_with(|| {
+                let id = next_internal_id;
+                next_internal_id += 1;
+                id
+            });
+
+            midi_id_map.insert(*midi_note, internal_id);
         }
 
-        // 4. Map and validate DMX outputs
+        for b in &self.behavior {
+            if let Some(internal_id) = id_to_internal.get(&b.id) {
+                behaviors.insert(*internal_id, BehaviorConfig {
+                    decay_seconds: b.decay_seconds,
+                    velocity_curve: b.velocity_curve,
+                    decay_profile: b.decay_profile,
+                });
+            }
+        }
+
         let mut dmx_outputs = Vec::new();
         for d in &self.output.dmx {
-            let internal_id = *id_map
-                .get(&d.id)
-                .ok_or_else(|| anyhow::anyhow!("DMX output maps to undefined ID '{}'", d.id))?;
-
-            if !behaviors.contains_key(&internal_id) {
-                bail!("DMX output ID '{}' has no defined behavior", d.id);
+            if let Some(internal_id) = id_to_internal.get(&d.id) {
+                dmx_outputs.push(DmxOutputCompiled {
+                    internal_id: *internal_id,
+                    channel: d.channel,
+                    color: d.color,
+                });
             }
-
-            dmx_outputs.push(DmxOutputCompiled {
-                internal_id,
-                dmx_channel: d.channel,
-                color: d.color,
-            });
         }
 
-        // 5. Map and validate Hue outputs
         let mut hue_outputs = Vec::new();
         for h in &self.output.hue {
-            let internal_id = *id_map
-                .get(&h.id)
-                .ok_or_else(|| anyhow::anyhow!("Hue output maps to undefined ID '{}'", h.id))?;
-
-            if !behaviors.contains_key(&internal_id) {
-                bail!("Hue output ID '{}' has no defined behavior", h.id);
+            if let Some(internal_id) = id_to_internal.get(&h.id) {
+                hue_outputs.push(HueOutputCompiled {
+                    internal_id: *internal_id,
+                    channel_id: h.channel_id,
+                    color: h.color,
+                });
             }
-
-            hue_outputs.push(HueOutputCompiled {
-                internal_id,
-                channel_id: h.channel_id,
-                color: h.color,
-            });
         }
 
         Ok(CompiledConfig {
@@ -256,29 +196,35 @@ pub fn update_hue_ip_in_config(config_path: &str, new_ip: &str) -> Result<()> {
         .parse::<DocumentMut>()
         .map_err(|e| anyhow::anyhow!("Failed to parse config for editing: {}", e))?;
 
-    // Find the hue target and update its bridge_ip
-    // Case 1: [[targets]] - Array of Tables
-    if let Some(targets) = doc
-        .get_mut("targets")
-        .and_then(|t| t.as_array_of_tables_mut())
-    {
-        for target in targets.iter_mut() {
-            if target.get("type").and_then(|v| v.as_str()) == Some("hue") {
-                target["bridge_ip"] = value(new_ip);
+    let mut updated = false;
+
+    if let Some(targets) = doc.get_mut("targets") {
+        // Case 1: [[targets]] - Array of Tables
+        if let Some(array) = targets.as_array_of_tables_mut() {
+            for target in array.iter_mut() {
+                if target.get("type").and_then(|v| v.as_str()) == Some("hue") {
+                    target["bridge_ip"] = value(new_ip);
+                    updated = true;
+                }
             }
         }
-    }
-    // Case 2: [targets] - Array of Inline Tables (or just an array of values)
-    else if let Some(targets) = doc.get_mut("targets").and_then(|t| t.as_array_mut()) {
-        for target in targets.iter_mut() {
-            if let Some(target_inline) = target.as_inline_table_mut() {
-                if target_inline.get("type").and_then(|v| v.as_str()) == Some("hue") {
-                    target_inline.insert("bridge_ip", value(new_ip).into_value().unwrap());
+        // Case 2: [targets] - Array of Inline Tables
+        else if let Some(array) = targets.as_array_mut() {
+            for target in array.iter_mut() {
+                if let Some(target_inline) = target.as_inline_table_mut() {
+                    if target_inline.get("type").and_then(|v| v.as_str()) == Some("hue") {
+                        target_inline.insert("bridge_ip", value(new_ip).into_value().unwrap());
+                        updated = true;
+                    }
                 }
             }
         }
     }
-    // Atomic write
+
+    if !updated {
+        bail!("No Hue target found in config to update");
+    }
+
     let path = Path::new(config_path);
     let tmp_path = path.with_extension("toml.tmp");
     fs::write(&tmp_path, doc.to_string())?;

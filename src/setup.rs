@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Input, Select};
 use directories::ProjectDirs;
@@ -86,8 +86,13 @@ impl ServerCertVerifier for HueCertVerifier {
             Err(e) => {
                 let err_msg = e.to_string().to_lowercase();
 
-                // Robustly catch Expired, NotValidYet, and all variations of SAN/CN Name Mismatches,
-                // completely bypassing how rustls/webpki boxes the underlying error variants.
+                // Robustly catch Expired, NotValidYet, and all variations of SAN/CN Name Mismatches.
+                //
+                // SECURITY NOTE: While we ignore name mismatches, we STILL validate the certificate 
+                // signature against the Hue Root CA (self.inner does this). This ensures we only 
+                // talk to authentic Philips Hue hardware. We must ignore name mismatches because 
+                // Hue Bridges list their ID in the Common Name (CN) field but lack Subject 
+                // Alternative Name (SAN) extensions, which modern webpki/rustls strictly requires.
                 if err_msg.contains("expired")
                     || err_msg.contains("not valid yet")
                     || err_msg.contains("not valid for name")
@@ -294,10 +299,25 @@ async fn perform_push_link(bridge_ip: &IpAddr, bridge_id: &str) -> Result<(Strin
         "generateclientkey": true
     });
 
-    loop {
-        let resp = client.post(&url).json(&body).send().await?;
+    // Timeout after 60 seconds of waiting for button press
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(60);
 
-        let results: Vec<HueAuthResponse> = resp.json().await?;
+    loop {
+        if start.elapsed() > timeout {
+            return Err(anyhow!(
+                "Timed out waiting for Hue Bridge button press (60s limit)."
+            ));
+        }
+
+        let resp = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to send push-link request")?;
+
+        let results: Vec<HueAuthResponse> = resp.json().await.context("Failed to parse Hue Auth response")?;
         if let Some(res) = results.first() {
             if let Some(success) = &res.success {
                 return Ok((success.username.clone(), success.clientkey.clone()));

@@ -84,7 +84,7 @@ struct Args {
     verbose: bool,
 
     /// Disable the TUI dashboard
-    #[arg(long, global = false)]
+    #[arg(long, global = true)]
     no_tui: bool,
 }
 
@@ -150,17 +150,17 @@ impl DmxFrameBuilder {
                     let g_val = (g as f32 * env.intensity) as u8;
                     let b_val = (b as f32 * env.intensity) as u8;
 
-                    if m.dmx_channel < 512 {
-                        frame[m.dmx_channel] = r_val;
+                    if m.channel < 512 {
+                        frame[m.channel] = r_val;
                     }
-                    if m.dmx_channel + 1 < 512 {
-                        frame[m.dmx_channel + 1] = g_val;
+                    if m.channel + 1 < 512 {
+                        frame[m.channel + 1] = g_val;
                     }
-                    if m.dmx_channel + 2 < 512 {
-                        frame[m.dmx_channel + 2] = b_val;
+                    if m.channel + 2 < 512 {
+                        frame[m.channel + 2] = b_val;
                     }
-                } else if m.dmx_channel < 512 {
-                    frame[m.dmx_channel] = env.dmx_value();
+                } else if m.channel < 512 {
+                    frame[m.channel] = env.dmx_value();
                 }
             }
         }
@@ -912,7 +912,7 @@ fn perform_shutdown(
                         // For RGB, check all 3 channels and derive max intensity relative to base color
                         for (offset, &base_val) in base_color.iter().enumerate() {
                             if base_val > 0 {
-                                if let Some(&default_val) = defaults.get(&(m.dmx_channel + offset))
+                                if let Some(&default_val) = defaults.get(&(m.channel + offset))
                                 {
                                     let intensity = default_val as f32 / base_val as f32;
                                     max_intensity = max_intensity.max(intensity);
@@ -921,7 +921,7 @@ fn perform_shutdown(
                         }
                     } else {
                         // For grayscale, just check the single channel
-                        if let Some(&default_val) = defaults.get(&m.dmx_channel) {
+                        if let Some(&default_val) = defaults.get(&m.channel) {
                             max_intensity = default_val as f32 / 255.0;
                         }
                     }
@@ -946,13 +946,13 @@ fn perform_shutdown(
                 if let Some(base_color) = m.color {
                     for (offset, &base_val) in base_color.iter().enumerate() {
                         if base_val > 0 {
-                            if let Some(&captured_val) = initial_state.get(m.dmx_channel + offset) {
+                            if let Some(&captured_val) = initial_state.get(m.channel + offset) {
                                 let intensity = captured_val as f32 / base_val as f32;
                                 max_intensity = max_intensity.max(intensity);
                             }
                         }
                     }
-                } else if let Some(&captured_val) = initial_state.get(m.dmx_channel) {
+                } else if let Some(&captured_val) = initial_state.get(m.channel) {
                     max_intensity = captured_val as f32 / 255.0;
                 }
 
@@ -1173,12 +1173,14 @@ mod tests {
         let mappings = vec![
             DmxOutputCompiled {
                 internal_id: 1,
-                dmx_channel: 0,
+                channel
+: 0,
                 color: None,
             },
             DmxOutputCompiled {
                 internal_id: 2,
-                dmx_channel: 5,
+                channel
+: 5,
                 color: Some([255, 128, 0]),
             },
         ];
@@ -1210,12 +1212,14 @@ mod tests {
         let dmx_outputs = vec![
             DmxOutputCompiled {
                 internal_id: 100,
-                dmx_channel: 0,
+                channel
+: 0,
                 color: None,
             },
             DmxOutputCompiled {
                 internal_id: 101,
-                dmx_channel: 10,
+                channel
+: 10,
                 color: Some([200, 0, 0]),
             },
         ];
@@ -1255,12 +1259,14 @@ mod tests {
         let dmx_outputs = vec![
             DmxOutputCompiled {
                 internal_id: 200,
-                dmx_channel: 5,
+                channel
+: 5,
                 color: None,
             },
             DmxOutputCompiled {
                 internal_id: 201,
-                dmx_channel: 10,
+                channel
+: 10,
                 color: Some([0, 255, 0]),
             },
         ];

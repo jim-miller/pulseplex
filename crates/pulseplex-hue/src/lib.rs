@@ -9,14 +9,18 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use pulseplex_core::{DecayEnvelope, LightSink};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{channel, Receiver as AsyncReceiver, Sender as AsyncSender};
-#[cfg(feature = "streaming")]
-use tracing::trace;
 use tracing::{error, info, warn};
 
 #[cfg(feature = "streaming")]
 use webrtc_dtls::config::Config;
 #[cfg(feature = "streaming")]
 use webrtc_dtls::conn::DTLSConn;
+
+#[cfg(feature = "streaming")]
+pub mod tls;
+
+#[cfg(feature = "streaming")]
+use crate::tls::HueCertVerifier;
 
 /// Compiled mapping for a single Hue light channel in an Entertainment Area.
 #[derive(Clone, Debug)]
@@ -155,9 +159,17 @@ async fn run_hue_background(
     {
         // 1. Activate the stream via PUT request
         info!("Activating Hue Entertainment Area {}...", area_id);
+        let provider = rustls::crypto::ring::default_provider();
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(HueCertVerifier::new()))
+            .with_no_client_auth();
+
         let client = reqwest::Client::builder()
             .use_rustls_tls()
-            .danger_accept_invalid_certs(true)
+            .use_preconfigured_tls(client_config)
             .build()?;
 
         let auth_resp = client

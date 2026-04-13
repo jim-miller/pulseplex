@@ -16,7 +16,8 @@ edition.workspace = true
 anyhow.workspace = true
 crossbeam-channel.workspace = true
 pulseplex-core.workspace = true
-pulseplex-hue = { workspace = true, default-features = false }
+# Enable streaming by default for the main binary
+pulseplex-hue = { workspace = true, default-features = false, features = ["streaming"] }
 tracing.workspace = true
 clap = { version = "4.5", features = ["derive"] }
 pulseplex-midi = { path = "crates/pulseplex-midi" }
@@ -35,7 +36,8 @@ crossterm = "0.28.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 mdns-sd = "0.13"
 directories = "6.0"
-tokio = { version = "1.43", features = ["rt", "macros"] }
+# Add 'time' feature for timeouts and sleeps
+tokio = { version = "1.43", features = ["rt", "macros", "time"] }
 serde_json = "1.0"
 tracing-appender = "0.2"
 semver = "1.0"
