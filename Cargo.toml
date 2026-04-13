@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 version = "0.2.0"
 authors = ["PulsePlex <contact@pulseplex.org>"]
-edition = "2021"                                # Stick to 2021 for maximum stability
+edition = "2021"
 
 [package]
 name = "pulseplex"
@@ -16,7 +16,7 @@ edition.workspace = true
 anyhow.workspace = true
 crossbeam-channel.workspace = true
 pulseplex-core.workspace = true
-pulseplex-hue.workspace = true
+pulseplex-hue = { workspace = true, default-features = false }
 tracing.workspace = true
 clap = { version = "4.5", features = ["derive"] }
 pulseplex-midi = { path = "crates/pulseplex-midi" }
@@ -31,16 +31,17 @@ dialoguer = "0.12.0"
 toml_edit = "0.25.8"
 ratatui = "0.29.0"
 crossterm = "0.28.1"
-reqwest = { version = "0.12", features = ["rustls-tls", "json", "blocking"] }
+# Force reqwest to use rustls to bypass macOS Security.framework limitations
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 mdns-sd = "0.13"
 directories = "6.0"
 tokio = { version = "1.43", features = ["rt", "macros"] }
 serde_json = "1.0"
 tracing-appender = "0.2"
 semver = "1.0"
+rustls = { workspace = true }
 rustls-pemfile = "2.1"
-rustls-pki-types = "1.10"
-rustls = { version = "0.23", features = ["ring"] }
+rustls-pki_types = { version = "1.10", package = "rustls-pki-types" }
 
 [workspace.dependencies]
 pulseplex-core = { path = "crates/pulseplex-core" }
@@ -50,3 +51,5 @@ crossbeam-channel = "0.5.15"
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.0"
 tracing = "0.1"
+# Global rustls lock: explicitly enable ring provider for consistency
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

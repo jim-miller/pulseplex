@@ -7,7 +7,7 @@ use pulseplex_core::BehaviorConfig;
 use serde::Deserialize;
 use toml_edit::{value, DocumentMut};
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct PulsePlexConfig {
     pub midi: MidiConfig,
     pub behavior: Vec<BehaviorDefinition>,
@@ -17,13 +17,13 @@ pub struct PulsePlexConfig {
     pub shutdown: ShutdownConfig,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct MidiConfig {
     pub device_name: String,
     pub mappings: HashMap<u8, String>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct BehaviorDefinition {
     pub id: String,
     pub decay_seconds: f32,
@@ -33,7 +33,7 @@ pub struct BehaviorDefinition {
     pub decay_profile: pulseplex_core::DecayProfile,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct OutputConfig {
     pub artnet: Option<ArtNetConfig>,
     pub dmx: Vec<DmxOutputDefinition>,
@@ -41,34 +41,34 @@ pub struct OutputConfig {
     pub hue: Vec<HueOutputDefinition>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct DmxOutputDefinition {
     pub id: String,
     pub channel: usize,
     pub color: Option<[u8; 3]>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct HueOutputDefinition {
     pub id: String,
     pub channel_id: u8,
     pub color: Option<[u8; 3]>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum TargetConfig {
     ArtNet(ArtNetConfig),
     Hue(HueConfig),
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct ArtNetConfig {
     pub target_ip: String,
     pub universe: u16,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct HueConfig {
     pub bridge_ip: String,
     pub username: String,
@@ -76,14 +76,18 @@ pub struct HueConfig {
     pub area_id: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
 pub enum ShutdownMode {
+    #[serde(alias = "Blackout")]
     Blackout,
+    #[serde(alias = "Default")]
     Default,
+    #[serde(alias = "Restore")]
     Restore,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct ShutdownConfig {
     pub mode: ShutdownMode,
     pub defaults: Option<HashMap<usize, u8>>,
@@ -326,4 +330,65 @@ pub fn get_config_path(cli_override: Option<&String>) -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("Could not determine configuration directory"))?;
 
     Ok(proj_dirs.config_dir().join("pulseplex.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_template_parsing() {
+        // This test ensures that the template we give users actually parses with current enum variants
+        let template = include_str!("../assets/default_edrums.toml");
+        let rendered = template
+            .replace("{midi_device}", "Test Device")
+            .replace("{bridge_ip}", "127.0.0.1")
+            .replace("{username}", "test-user")
+            .replace("{client_key}", "test-key")
+            .replace("{area_id}", "12345678-1234-1234-1234-123456789012");
+
+        let config: Result<PulsePlexConfig, _> = toml::from_str(&rendered);
+        assert!(
+            config.is_ok(),
+            "Template failed to parse: {:?}",
+            config.err()
+        );
+
+        let config = config.unwrap();
+        assert_eq!(config.shutdown.mode, ShutdownMode::Blackout);
+        assert_eq!(config.behavior[0].id, "snare");
+    }
+
+    #[test]
+    fn test_case_insensitivity() {
+        let toml_str = r#"
+            [midi]
+            device_name = "Test"
+            mappings = {}
+
+            [[behavior]]
+            id = "test"
+            decay_seconds = 1.0
+            velocity_curve = "Hard"
+            decay_profile = "Exponential"
+
+            [output]
+            dmx = []
+            hue = []
+
+            [shutdown]
+            mode = "Restore"
+        "#;
+
+        let config: PulsePlexConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.shutdown.mode, ShutdownMode::Restore);
+        assert_eq!(
+            config.behavior[0].velocity_curve,
+            pulseplex_core::VelocityCurve::Hard
+        );
+        assert_eq!(
+            config.behavior[0].decay_profile,
+            pulseplex_core::DecayProfile::Exponential
+        );
+    }
 }

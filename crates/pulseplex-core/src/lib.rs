@@ -3,20 +3,25 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum VelocityCurve {
     #[default]
+    #[serde(alias = "Linear")]
     Linear,
+    #[serde(alias = "Hard")]
     Hard,
+    #[serde(alias = "Soft")]
     Soft,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum DecayProfile {
     #[default]
+    #[serde(alias = "Linear")]
     Linear,
+    #[serde(alias = "Exponential")]
     Exponential,
 }
 

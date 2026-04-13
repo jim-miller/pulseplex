@@ -9,8 +9,13 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use pulseplex_core::{DecayEnvelope, LightSink};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{channel, Receiver as AsyncReceiver, Sender as AsyncSender};
+#[cfg(feature = "streaming")]
+use tracing::trace;
 use tracing::{error, info, warn};
+
+#[cfg(feature = "streaming")]
 use webrtc_dtls::config::Config;
+#[cfg(feature = "streaming")]
 use webrtc_dtls::conn::DTLSConn;
 
 /// Compiled mapping for a single Hue light channel in an Entertainment Area.
@@ -137,57 +142,115 @@ async fn run_hue_background(
 ) -> Result<()> {
     info!("Starting Hue background thread for bridge {}", bridge_ip);
 
-    let addr: SocketAddr = format!("{}:2100", bridge_ip).parse()?;
-    let psk = hex::decode(client_key.replace("-", ""))?;
-    let psk_id = username.as_bytes().to_vec();
+    #[cfg(not(feature = "streaming"))]
+    {
+        warn!("Hue streaming is disabled in this build. Buffers will be recycled but not sent.");
+        while let Some(frame) = rx.recv().await {
+            let _ = pool_tx.try_send(frame);
+        }
+        return Ok(());
+    }
 
-    let config = Config {
-        psk: Some(Arc::new(move |_| Ok(psk.clone()))),
-        psk_identity_hint: Some(psk_id),
-        ..Default::default()
-    };
+    #[cfg(feature = "streaming")]
+    {
+        // 1. Activate the stream via PUT request
+        info!("Activating Hue Entertainment Area {}...", area_id);
+        let client = reqwest::Client::builder()
+            .use_rustls_tls()
+            .danger_accept_invalid_certs(true)
+            .build()?;
 
-    loop {
-        info!("Connecting to Hue bridge at {} via DTLS...", addr);
+        let auth_resp = client
+            .get(format!("https://{}/auth/v1", bridge_ip))
+            .header("hue-application-key", &username)
+            .send()
+            .await?;
 
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        socket.connect(addr).await?;
+        let app_id = auth_resp
+            .headers()
+            .get("hue-application-id")
+            .ok_or_else(|| anyhow!("Missing hue-application-id header from Bridge"))?
+            .to_str()?
+            .to_string();
 
-        let dtls_conn = match DTLSConn::new(Arc::new(socket), config.clone(), true, None).await {
-            Ok(conn) => conn,
-            Err(e) => {
-                // If the channel is closed while we are trying to connect, we can exit.
-                // try_recv isn't available on AsyncReceiver without mutable access,
-                // and we already have mut rx. Let's just do a non-blocking check.
-                if rx.is_closed() {
-                    info!("Hue sender disconnected during connect; exiting.");
-                    return Ok(());
-                }
-                error!("DTLS handshake failed: {}. Retrying in 5s...", e);
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
-            }
+        info!("Retrieved Hue Application ID for DTLS handshake.");
+
+        let activation_url = format!(
+            "https://{}/clip/v2/resource/entertainment_configuration/{}",
+            bridge_ip, area_id
+        );
+
+        let resp = client
+            .put(&activation_url)
+            .header("hue-application-key", &username)
+            .json(&serde_json::json!({"action": "start"}))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(anyhow!(
+                "Failed to activate Hue Entertainment Area: Bridge returned {}",
+                resp.status()
+            ));
+        }
+        info!("Hue Entertainment Area activated.");
+
+        // 2. Setup DTLS
+        let addr: SocketAddr = format!("{}:2100", bridge_ip).parse()?;
+        let psk = hex::decode(client_key.replace("-", ""))?;
+        let psk_id = app_id.as_bytes().to_vec();
+
+        let config = Config {
+            psk: Some(Arc::new(move |_| Ok(psk.clone()))),
+            psk_identity_hint: Some(psk_id),
+            cipher_suites: vec![
+                webrtc_dtls::cipher_suite::CipherSuiteId::Tls_Psk_With_Aes_128_Gcm_Sha256,
+            ],
+            server_name: bridge_ip.clone(),
+            ..Default::default()
         };
 
-        info!("Hue DTLS connection established.");
+        loop {
+            info!("Connecting to Hue bridge at {} via DTLS...", addr);
 
-        match stream_to_hue(dtls_conn, &mappings, &mut rx, &pool_tx, &area_id).await {
-            Ok(_) => {
-                info!("Hue background thread shutting down cleanly.");
-                return Ok(());
-            }
-            Err(e) => {
-                if rx.is_closed() {
-                    info!("Hue sender disconnected; exiting background task.");
+            let socket = UdpSocket::bind("0.0.0.0:0").await?;
+            socket.connect(addr).await?;
+
+            let dtls_conn = match DTLSConn::new(Arc::new(socket), config.clone(), true, None).await
+            {
+                Ok(conn) => conn,
+                Err(e) => {
+                    if rx.is_closed() {
+                        info!("Hue sender disconnected during connect; exiting.");
+                        return Ok(());
+                    }
+                    error!("DTLS handshake failed: {}. Retrying in 5s...", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            info!("Hue DTLS connection established.");
+
+            match stream_to_hue(dtls_conn, &mappings, &mut rx, &pool_tx, &area_id).await {
+                Ok(_) => {
+                    info!("Hue background thread shutting down cleanly.");
                     return Ok(());
                 }
-                warn!("Hue streaming error: {}. Reconnecting...", e);
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                Err(e) => {
+                    if rx.is_closed() {
+                        info!("Hue sender disconnected; exiting background task.");
+                        return Ok(());
+                    }
+                    warn!("Hue streaming error: {}. Reconnecting...", e);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             }
         }
     }
 }
 
+#[cfg(feature = "streaming")]
 async fn stream_to_hue(
     conn: DTLSConn,
     mappings: &[HueOutputMapping],
@@ -198,10 +261,13 @@ async fn stream_to_hue(
     let mut sequence: u8 = 0;
 
     loop {
-        // Wait for next frame (async-native)
         let intensities = match rx.recv().await {
             Some(i) => i,
-            None => return Ok(()), // Channel closed
+            None => {
+                info!("Channel closed. Sending close_notify to Hue Bridge...");
+                let _ = conn.close().await;
+                return Ok(());
+            }
         };
 
         let buf = build_huestream_packet(&intensities, mappings, sequence, area_id)?;

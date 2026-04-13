@@ -30,7 +30,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use spin_sleep::SpinSleeper;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::config::{DmxOutputCompiled, TargetConfig};
@@ -84,7 +84,7 @@ struct Args {
     verbose: bool,
 
     /// Disable the TUI dashboard
-    #[arg(long, global = true)]
+    #[arg(long, global = false)]
     no_tui: bool,
 }
 
@@ -282,6 +282,7 @@ impl DashboardState {
 }
 
 fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Args::parse();
 
     // 1. Setup Rolling Logs
@@ -313,7 +314,7 @@ fn main() -> anyhow::Result<()> {
     // 3. Version Check in Background
     std::thread::spawn(|| {
         if let Err(e) = check_for_updates() {
-            tracing::debug!("Update check failed: {}", e);
+            debug!("Update check failed: {}", e);
         }
     });
 
@@ -327,7 +328,8 @@ fn main() -> anyhow::Result<()> {
             handle_check(path.to_string_lossy().as_ref())?;
         }
         Commands::Doctor { config } => {
-            doctor::run_doctor(config.as_ref())?;
+            let path = get_config_path(config.as_ref())?;
+            doctor::run_doctor(&path)?;
         }
         Commands::Template { action } => match action {
             TemplateAction::Eject => {

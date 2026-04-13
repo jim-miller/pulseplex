@@ -9,20 +9,20 @@ mappings = { 38 = "snare", 36 = "kick", 46 = "hihat_open", 42 = "hihat_closed" }
 [[behavior]]
 id = "snare"
 decay_seconds = 0.25
-velocity_curve = "exp"
-decay_profile = "linear"
+velocity_curve = "soft"
+decay_profile = "exponential"
 
 [[behavior]]
 id = "kick"
 decay_seconds = 0.35
-velocity_curve = "linear"
-decay_profile = "linear"
+velocity_curve = "hard"
+decay_profile = "exponential"
 
 [[behavior]]
 id = "hihat_open"
 decay_seconds = 0.5
 velocity_curve = "linear"
-decay_profile = "linear"
+decay_profile = "exponential"
 
 [[behavior]]
 id = "hihat_closed"
