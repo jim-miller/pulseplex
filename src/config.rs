@@ -71,6 +71,7 @@ pub struct ArtNetConfig {
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct HueConfig {
     pub bridge_ip: String,
+    pub bridge_id: String,
     pub username: String,
     pub client_key: String,
     pub area_id: String,

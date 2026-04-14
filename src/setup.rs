@@ -163,6 +163,7 @@ pub fn run_wizard() -> Result<PathBuf> {
     let config_content = DEFAULT_CONFIG_TEMPLATE
         .replace("{midi_device}", midi_device)
         .replace("{bridge_ip}", &bridge_ip.to_string())
+        .replace("{bridge_id}", &bridge_id)
         .replace("{username}", &username)
         .replace("{client_key}", &client_key)
         .replace("{area_id}", &area_id);
@@ -264,7 +265,7 @@ pub fn build_hue_client(bridge_ip: &std::net::IpAddr, bridge_id: &str) -> Result
         .map_err(|e| anyhow!("Failed to build Hue HTTP client: {}", e))
 }
 
-pub async fn discover_bridge_by_id_fallback(_username: &str) -> Result<IpAddr> {
+pub async fn discover_bridge_by_id_fallback(target_id: &str) -> Result<IpAddr> {
     if let Ok(mdns) = ServiceDaemon::new() {
         let receiver = mdns.browse("_hue._tcp.local.")?;
         let now = std::time::Instant::now();
@@ -272,19 +273,28 @@ pub async fn discover_bridge_by_id_fallback(_username: &str) -> Result<IpAddr> {
             if let Ok(ServiceEvent::ServiceResolved(info)) =
                 receiver.recv_timeout(Duration::from_millis(500))
             {
-                // Prefer IPv4
-                let addresses = info.get_addresses();
-                let ip = addresses
-                    .iter()
-                    .find(|ip| ip.is_ipv4())
-                    .or_else(|| addresses.iter().next())
-                    .ok_or_else(|| anyhow!("No IP found for mDNS service"))?;
-                let ip = *ip;
-                return Ok(ip);
+                let bridge_id = match info.get_property_val("bridgeid") {
+                    Some(Some(id_bytes)) => String::from_utf8_lossy(id_bytes).to_lowercase(),
+                    _ => "".to_string(),
+                };
+
+                if bridge_id == target_id.to_lowercase() {
+                    // Prefer IPv4
+                    let addresses = info.get_addresses();
+                    let ip = addresses
+                        .iter()
+                        .find(|ip| ip.is_ipv4())
+                        .or_else(|| addresses.iter().next())
+                        .ok_or_else(|| anyhow!("No IP found for mDNS service"))?;
+                    return Ok(*ip);
+                }
             }
         }
     }
-    Err(anyhow!("Could not find any Hue bridge on the network"))
+    Err(anyhow!(
+        "Could not find Hue bridge with ID {} on the network",
+        target_id
+    ))
 }
 
 async fn perform_push_link(bridge_ip: &IpAddr, bridge_id: &str) -> Result<(String, String)> {

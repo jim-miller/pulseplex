@@ -42,6 +42,7 @@ hue = [
 [[targets]]
 type = "hue"
 bridge_ip = "{bridge_ip}"
+bridge_id = "{bridge_id}"
 username = "{username}"
 client_key = "{client_key}"
 area_id = "{area_id}"

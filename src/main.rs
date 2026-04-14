@@ -552,11 +552,8 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                             .enable_all()
                             .build()?;
                         let new_ip = rt.block_on(async {
-                            // Try to find the bridge by its ID if we can extract it,
-                            // otherwise we'd need to prompt or have it in config.
-                            // In a real scenario, we should have the Bridge ID in the config.
-                            // For this implementation, we'll try to find any bridge and see if it helps.
-                            setup::discover_bridge_by_id_fallback(&hue.username).await
+                            // Targeted discovery via Bridge ID to handle DHCP IP changes
+                            setup::discover_bridge_by_id_fallback(&hue.bridge_id).await
                         });
 
                         if let Ok(ip) = new_ip {
