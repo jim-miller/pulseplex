@@ -11,7 +11,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{channel, Receiver as AsyncReceiver, Sender as AsyncSender};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 #[cfg(feature = "streaming")]
 use webrtc_dtls::config::Config;
@@ -451,7 +451,7 @@ async fn stream_to_hue(
         sequence = sequence.wrapping_add(1);
 
         if intensities.iter().any(|&v| v > 0.0) {
-            debug!(
+            trace!(
                 "Sending non-zero Hue frame: size={}, intensities={:?}",
                 buf.len(),
                 intensities
@@ -557,5 +557,94 @@ mod tests {
         assert_eq!(packet[54], 0xFF);
         assert_eq!(packet[59], 0x01);
         assert_eq!(packet[60], 0x80);
+    }
+}
+
+#[cfg(test)]
+mod tests_tls {
+    use super::*;
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+    use std::fmt;
+
+    // Create a custom error type to simulate the deep webpki error
+    #[derive(Debug)]
+    struct MockWebpkiError(String);
+
+    impl fmt::Display for MockWebpkiError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+    impl std::error::Error for MockWebpkiError {}
+
+    // A mock verifier that simulates the strict modern webpki behavior
+    // by intentionally failing the SAN/Common Name check using the dynamic 'Other' variant.
+    #[derive(Debug)]
+    struct MockStrictVerifier;
+
+    impl ServerCertVerifier for MockStrictVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            // Simulate the EXACT dynamic string error the Hue Bridge throws in the real world,
+            // boxed inside the 'Other' variant.
+            let error_msg = "invalid peer certificate: certificate not valid for name \"001788fffea43aaf\"; certificate is not valid for any names".to_string();
+
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Other(rustls::OtherError(Arc::new(MockWebpkiError(
+                    error_msg,
+                )))),
+            ))
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![]
+        }
+    }
+
+    #[test]
+    fn test_hue_verifier_suppresses_san_errors() {
+        // Wrap our mock strict verifier inside our custom Hue verifier
+        let verifier = HueCertVerifier {
+            inner: Arc::new(MockStrictVerifier),
+        };
+
+        // Provide dummy data for the signature
+        let dummy_cert = CertificateDer::from(vec![0]);
+        let server_name = ServerName::try_from("dummy-bridge-id").unwrap();
+        let now = UnixTime::since_unix_epoch(Duration::from_secs(0));
+
+        let result = verifier.verify_server_cert(&dummy_cert, &[], &server_name, &[], now);
+
+        // The inner verifier throws NotValidForName (boxed in Other), but our wrapper MUST
+        // catch it via string inspection, suppress it, and return Ok.
+        assert!(
+            result.is_ok(),
+            "HueCertVerifier failed to suppress the boxed NotValidForName error!"
+        );
     }
 }

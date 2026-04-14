@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tracing::{debug, trace};
+use tracing::trace;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -91,9 +91,10 @@ impl DecayEnvelope {
             VelocityCurve::Hard => normalized.powi(2),
             VelocityCurve::Soft => normalized.sqrt(),
         };
-        debug!(
+        trace!(
             "Envelope triggered: velocity={}, intensity={:.3}",
-            velocity, self.intensity
+            velocity,
+            self.intensity
         );
     }
 
@@ -173,15 +174,16 @@ impl PulsePlexEngine {
         source.poll(signal_buffer)?;
 
         if !signal_buffer.is_empty() {
-            debug!("Engine polled {} signals", signal_buffer.len());
+            trace!("Engine polled {} signals", signal_buffer.len());
         }
 
         for signal in signal_buffer.iter() {
             if let Signal::Trigger { id, velocity } = *signal {
                 if let Some(config) = self.behaviors.get(&id) {
-                    debug!(
+                    trace!(
                         "Processing trigger for behavior id={}, velocity={}",
-                        id, velocity
+                        id,
+                        velocity
                     );
                     let mut env = DecayEnvelope::new(
                         config.decay_seconds,
@@ -191,7 +193,7 @@ impl PulsePlexEngine {
                     env.trigger(velocity);
                     self.active_lights.insert(id, env);
                 } else {
-                    debug!("No behavior found for id={}", id);
+                    trace!("No behavior found for id={}", id);
                 }
             }
         }

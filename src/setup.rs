@@ -8,14 +8,12 @@ use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Input, Select};
 use directories::ProjectDirs;
 use mdns_sd::{ServiceDaemon, ServiceEvent};
+use pulseplex_hue::HueCertVerifier;
 use reqwest::Client;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::runtime::Builder;
 
-const HUE_CA_CERT: &[u8] = include_bytes!("../assets/hue_ca_bundle.pem");
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../assets/default_edrums.toml");
 
 #[derive(Debug, Deserialize)]
@@ -39,97 +37,6 @@ struct HueAuthSuccess {
 #[derive(Debug, Deserialize)]
 struct HueAuthError {
     description: String,
-}
-
-/// A custom verifier that handles Philips Hue Bridge certificates.
-/// macOS Security.framework rejects them because their validity period is too long.
-/// This verifier keeps the connection encrypted but ignores the validity period limit.
-#[derive(Debug)]
-struct HueCertVerifier {
-    inner: Arc<dyn ServerCertVerifier>,
-}
-
-impl HueCertVerifier {
-    fn new() -> Self {
-        let mut roots = rustls::RootCertStore::empty();
-        let mut cursor = std::io::Cursor::new(HUE_CA_CERT);
-        for cert in rustls_pemfile::certs(&mut cursor).flatten() {
-            roots.add(cert).ok();
-        }
-
-        let inner = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
-            .build()
-            .expect("Failed to build base WebPkiServerVerifier");
-
-        Self { inner }
-    }
-}
-
-impl ServerCertVerifier for HueCertVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-        server_name: &ServerName<'_>,
-        ocsp_response: &[u8],
-        now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        // Delegate to the standard verifier first
-        match self.inner.verify_server_cert(
-            end_entity,
-            intermediates,
-            server_name,
-            ocsp_response,
-            now,
-        ) {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                let err_msg = e.to_string().to_lowercase();
-
-                // Robustly catch Expired, NotValidYet, and all variations of SAN/CN Name Mismatches.
-                //
-                // SECURITY NOTE: While we ignore name mismatches, we STILL validate the certificate
-                // signature against the Hue Root CA (self.inner does this). This ensures we only
-                // talk to authentic Philips Hue hardware. We must ignore name mismatches because
-                // Hue Bridges list their ID in the Common Name (CN) field but lack Subject
-                // Alternative Name (SAN) extensions, which modern webpki/rustls strictly requires.
-                if err_msg.contains("expired")
-                    || err_msg.contains("not valid yet")
-                    || err_msg.contains("not valid for name")
-                    || err_msg.contains("not valid for any names")
-                    || err_msg.contains("subjectaltname")
-                {
-                    Ok(ServerCertVerified::assertion())
-                } else {
-                    // It's a true cryptographic failure (e.g., bad signature, wrong CA). Reject it!
-                    Err(e)
-                }
-            }
-        }
-    }
-
-    // Safely delegate all actual cryptographic math back to rustls!
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(message, cert, dss)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.inner.supported_verify_schemes()
-    }
 }
 
 pub fn run_wizard() -> Result<PathBuf> {
@@ -404,93 +311,4 @@ async fn select_entertainment_area(
         .interact()?;
 
     Ok(v2_resp.data[selection].id.clone())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rustls::client::danger::ServerCertVerified;
-    use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
-    use std::fmt;
-
-    // Create a custom error type to simulate the deep webpki error
-    #[derive(Debug)]
-    struct MockWebpkiError(String);
-
-    impl fmt::Display for MockWebpkiError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "{}", self.0)
-        }
-    }
-    impl std::error::Error for MockWebpkiError {}
-
-    // A mock verifier that simulates the strict modern webpki behavior
-    // by intentionally failing the SAN/Common Name check using the dynamic 'Other' variant.
-    #[derive(Debug)]
-    struct MockStrictVerifier;
-
-    impl ServerCertVerifier for MockStrictVerifier {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
-            // Simulate the EXACT dynamic string error the Hue Bridge throws in the real world,
-            // boxed inside the 'Other' variant.
-            let error_msg = "invalid peer certificate: certificate not valid for name \"001788fffea43aaf\"; certificate is not valid for any names".to_string();
-
-            Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::Other(rustls::OtherError(Arc::new(MockWebpkiError(
-                    error_msg,
-                )))),
-            ))
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            vec![]
-        }
-    }
-
-    #[test]
-    fn test_hue_verifier_suppresses_san_errors() {
-        // Wrap our mock strict verifier inside our custom Hue verifier
-        let verifier = HueCertVerifier {
-            inner: Arc::new(MockStrictVerifier),
-        };
-
-        // Provide dummy data for the signature
-        let dummy_cert = CertificateDer::from(vec![0]);
-        let server_name = ServerName::try_from("dummy-bridge-id").unwrap();
-        let now = UnixTime::since_unix_epoch(Duration::from_secs(0));
-
-        let result = verifier.verify_server_cert(&dummy_cert, &[], &server_name, &[], now);
-
-        // The inner verifier throws NotValidForName (boxed in Other), but our wrapper MUST
-        // catch it via string inspection, suppress it, and return Ok.
-        assert!(
-            result.is_ok(),
-            "HueCertVerifier failed to suppress the boxed NotValidForName error!"
-        );
-    }
 }
