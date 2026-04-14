@@ -298,7 +298,7 @@ fn main() -> anyhow::Result<()> {
 
     // 2. Setup logging (verbose flag is global)
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(if cli.verbose { "trace" } else { "info" }));
+        .unwrap_or_else(|_| EnvFilter::new(if cli.verbose { "debug" } else { "info" }));
 
     let registry = tracing_subscriber::registry()
         .with(filter)
@@ -375,12 +375,23 @@ fn check_for_updates() -> anyhow::Result<()> {
         .get("https://api.github.com/repos/pulseplex/pulseplex/releases/latest")
         .send()?;
 
+    if !resp.status().is_success() {
+        return Ok(());
+    }
+
     #[derive(serde::Deserialize)]
     struct GithubRelease {
         tag_name: String,
     }
 
-    let latest: GithubRelease = resp.json()?;
+    let body: serde_json::Value = resp.json()?;
+    let latest: GithubRelease = match serde_json::from_value(body.clone()) {
+        Ok(j) => j,
+        Err(e) => {
+            debug!("Failed to parse GitHub release JSON: {}. Body: {}", e, body);
+            return Ok(());
+        }
+    };
     let current_v = semver::Version::parse(env!("CARGO_PKG_VERSION"))?;
     let latest_v = semver::Version::parse(latest.tag_name.trim_start_matches('v'))?;
 

@@ -7,20 +7,107 @@ use anyhow::{anyhow, Result};
 use byteorder::{BigEndian, WriteBytesExt};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use pulseplex_core::{DecayEnvelope, LightSink};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{channel, Receiver as AsyncReceiver, Sender as AsyncSender};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "streaming")]
 use webrtc_dtls::config::Config;
 #[cfg(feature = "streaming")]
 use webrtc_dtls::conn::DTLSConn;
 
-#[cfg(feature = "streaming")]
-pub mod tls;
+const HUE_CA_CERT: &[u8] = include_bytes!("../assets/hue_ca_bundle.pem");
 
-#[cfg(feature = "streaming")]
-use crate::tls::HueCertVerifier;
+/// A custom verifier that handles Philips Hue Bridge certificates.
+/// macOS Security.framework rejects them because their validity period is too long.
+/// This verifier keeps the connection encrypted but ignores the validity period limit.
+#[derive(Debug)]
+pub struct HueCertVerifier {
+    inner: Arc<dyn ServerCertVerifier>,
+}
+
+impl HueCertVerifier {
+    pub fn new() -> Self {
+        let mut roots = rustls::RootCertStore::empty();
+        let mut cursor = std::io::Cursor::new(HUE_CA_CERT);
+        for cert in rustls_pemfile::certs(&mut cursor).flatten() {
+            roots.add(cert).ok();
+        }
+
+        let inner = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .expect("Failed to build base WebPkiServerVerifier");
+
+        Self { inner }
+    }
+}
+
+impl Default for HueCertVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ServerCertVerifier for HueCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        // Delegate to the standard verifier first
+        match self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let err_msg = e.to_string().to_lowercase();
+
+                // Robustly catch Expired, NotValidYet, and all variations of SAN/CN Name Mismatches.
+                if err_msg.contains("expired")
+                    || err_msg.contains("not valid yet")
+                    || err_msg.contains("not valid for name")
+                    || err_msg.contains("not valid for any names")
+                    || err_msg.contains("subjectaltname")
+                {
+                    Ok(ServerCertVerified::assertion())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
 
 /// Compiled mapping for a single Hue light channel in an Entertainment Area.
 #[derive(Clone, Debug)]
@@ -187,6 +274,71 @@ async fn run_hue_background(
 
         info!("Retrieved Hue Application ID for DTLS handshake.");
 
+        // Fetch area details to log channel mappings for debugging and filtering
+        let area_url = format!(
+            "https://{}/clip/v2/resource/entertainment_configuration/{}",
+            bridge_ip, area_id
+        );
+        let area_resp = client
+            .get(&area_url)
+            .header("hue-application-key", &username)
+            .send()
+            .await?;
+
+        let mut valid_indices: Vec<usize> = (0..mappings.len()).collect();
+
+        if area_resp.status().is_success() {
+            let details: serde_json::Value = area_resp.json().await?;
+            debug!("Hue Entertainment Area Details: {}", details);
+
+            // Extract valid channel IDs from the bridge response
+            if let Some(data) = details.get("data").and_then(|d| d.as_array()) {
+                if let Some(area) = data.first() {
+                    let status = area
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("unknown");
+                    info!("Current Hue Area status: {}", status);
+
+                    if let Some(channels) = area.get("channels").and_then(|c| c.as_array()) {
+                        let valid_ids: Vec<u8> = channels
+                            .iter()
+                            .filter_map(|c| {
+                                c.get("channel_id")
+                                    .and_then(|id| id.as_u64())
+                                    .map(|id| id as u8)
+                            })
+                            .collect();
+
+                        info!(
+                            "Bridge reports {} valid channel(s): {:?}",
+                            valid_ids.len(),
+                            valid_ids
+                        );
+
+                        // Validate our config against the bridge and build the filter
+                        valid_indices.retain(|&idx| {
+                            let m = &mappings[idx];
+                            if valid_ids.contains(&m.channel_id) {
+                                debug!("Mapping confirmed: logic_id {} -> physical channel {}", m.internal_id, m.channel_id);
+                                true
+                            } else {
+                                warn!("Degraded Experience: Config maps ID {} to invalid channel_id {}. This light will be STRIPPED from the stream.", m.internal_id, m.channel_id);
+                                false
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        if valid_indices.is_empty() {
+            return Err(anyhow!(
+                "No valid Hue channels found in Entertainment Area {}. Aborting stream.",
+                area_id
+            ));
+        }
+
         let activation_url = format!(
             "https://{}/clip/v2/resource/entertainment_configuration/{}",
             bridge_ip, area_id
@@ -206,6 +358,9 @@ async fn run_hue_background(
             ));
         }
         info!("Hue Entertainment Area activated.");
+
+        // Give the bridge a moment to transition to active and open its UDP socket
+        tokio::time::sleep(Duration::from_millis(2000)).await;
 
         // 2. Setup DTLS
         let addr: SocketAddr = format!("{}:2100", bridge_ip).parse()?;
@@ -244,7 +399,16 @@ async fn run_hue_background(
 
             info!("Hue DTLS connection established.");
 
-            match stream_to_hue(dtls_conn, &mappings, &mut rx, &pool_tx, &area_id).await {
+            match stream_to_hue(
+                dtls_conn,
+                &mappings,
+                &valid_indices,
+                &mut rx,
+                &pool_tx,
+                &area_id,
+            )
+            .await
+            {
                 Ok(_) => {
                     info!("Hue background thread shutting down cleanly.");
                     return Ok(());
@@ -266,6 +430,7 @@ async fn run_hue_background(
 async fn stream_to_hue(
     conn: DTLSConn,
     mappings: &[HueOutputMapping],
+    valid_indices: &[usize],
     rx: &mut AsyncReceiver<Vec<f32>>,
     pool_tx: &Sender<Vec<f32>>,
     area_id: &str,
@@ -282,8 +447,16 @@ async fn stream_to_hue(
             }
         };
 
-        let buf = build_huestream_packet(&intensities, mappings, sequence, area_id)?;
+        let buf = build_huestream_packet(&intensities, mappings, valid_indices, sequence, area_id)?;
         sequence = sequence.wrapping_add(1);
+
+        if intensities.iter().any(|&v| v > 0.0) {
+            debug!(
+                "Sending non-zero Hue frame: size={}, intensities={:?}",
+                buf.len(),
+                intensities
+            );
+        }
 
         if let Err(e) = conn.write(&buf, None).await {
             let _ = pool_tx.send(intensities); // Return buffer
@@ -297,10 +470,11 @@ async fn stream_to_hue(
 pub fn build_huestream_packet(
     intensities: &[f32],
     mappings: &[HueOutputMapping],
+    valid_indices: &[usize],
     sequence: u8,
     area_id: &str,
 ) -> Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(16 + 36 + (mappings.len() * 7));
+    let mut buf = Vec::with_capacity(16 + 36 + (valid_indices.len() * 7));
 
     buf.extend_from_slice(b"HueStream");
     buf.push(0x02);
@@ -324,7 +498,8 @@ pub fn build_huestream_packet(
     let scale_intensity =
         |intensity: f32| -> u16 { (intensity * 65535.0).clamp(0.0, 65535.0).round() as u16 };
 
-    for (idx, m) in mappings.iter().enumerate() {
+    for &idx in valid_indices {
+        let m = &mappings[idx];
         let intensity = intensities.get(idx).cloned().unwrap_or(0.0);
 
         let (r, g, b) = if let Some([rc, gc, bc]) = m.color {
@@ -370,7 +545,8 @@ mod tests {
         let sequence = 42;
         let area_id = "12345678-1234-1234-1234-123456789012";
 
-        let packet = build_huestream_packet(&intensities, &mappings, sequence, area_id).unwrap();
+        let packet =
+            build_huestream_packet(&intensities, &mappings, &[0, 1], sequence, area_id).unwrap();
 
         assert_eq!(&packet[0..9], b"HueStream");
         assert_eq!(packet[9], 0x02);

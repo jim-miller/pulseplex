@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::Deserialize;
+use tracing::{debug, trace};
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -90,11 +91,16 @@ impl DecayEnvelope {
             VelocityCurve::Hard => normalized.powi(2),
             VelocityCurve::Soft => normalized.sqrt(),
         };
+        debug!(
+            "Envelope triggered: velocity={}, intensity={:.3}",
+            velocity, self.intensity
+        );
     }
 
     /// Progress the decay by one tick
     pub fn tick(&mut self, dt: Duration) {
         let dt_seconds = dt.as_secs_f32();
+        let prev_intensity = self.intensity;
         match self.decay_profile {
             DecayProfile::Linear => {
                 let reduction = self.decay_per_second * dt_seconds;
@@ -109,6 +115,13 @@ impl DecayEnvelope {
                     self.intensity = 0.0;
                 }
             }
+        }
+        if self.intensity > 0.0 || prev_intensity > 0.0 {
+            trace!(
+                "Envelope tick: prev={:.3}, current={:.3}",
+                prev_intensity,
+                self.intensity
+            );
         }
     }
 
@@ -159,9 +172,17 @@ impl PulsePlexEngine {
         signal_buffer.clear();
         source.poll(signal_buffer)?;
 
+        if !signal_buffer.is_empty() {
+            debug!("Engine polled {} signals", signal_buffer.len());
+        }
+
         for signal in signal_buffer.iter() {
             if let Signal::Trigger { id, velocity } = *signal {
                 if let Some(config) = self.behaviors.get(&id) {
+                    debug!(
+                        "Processing trigger for behavior id={}, velocity={}",
+                        id, velocity
+                    );
                     let mut env = DecayEnvelope::new(
                         config.decay_seconds,
                         config.velocity_curve,
@@ -169,6 +190,8 @@ impl PulsePlexEngine {
                     );
                     env.trigger(velocity);
                     self.active_lights.insert(id, env);
+                } else {
+                    debug!("No behavior found for id={}", id);
                 }
             }
         }
@@ -178,6 +201,10 @@ impl PulsePlexEngine {
             env.tick(dt);
             !env.is_dead()
         });
+
+        if !self.active_lights.is_empty() {
+            trace!("Active lights count: {}", self.active_lights.len());
+        }
 
         // Push to all sinks - Protocol-native routing happens in the sinks.
         for sink in sinks {
