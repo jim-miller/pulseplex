@@ -1,4 +1,6 @@
 mod config;
+mod doctor;
+mod setup;
 
 use std::collections::HashMap;
 use std::io::{self, IsTerminal};
@@ -13,10 +15,11 @@ use pulseplex_core::{ArtNetBridge, DecayEnvelope, LightSink, PulsePlexEngine, Si
 use pulseplex_hue::{HueOutputMapping, HueSink};
 use pulseplex_midi::setup_midi;
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::Select;
+use directories::ProjectDirs;
 use notify::Watcher;
 use ratatui::{
     backend::CrosstermBackend,
@@ -27,7 +30,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use spin_sleep::SpinSleeper;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::config::{DmxOutputCompiled, TargetConfig};
@@ -61,7 +64,10 @@ impl Drop for TerminalGuard {
     }
 }
 
-use crate::config::{get_config_path, update_midi_device_in_config, PulsePlexConfig, ShutdownMode};
+use crate::config::{
+    get_config_path, update_hue_ip_in_config, update_midi_device_in_config, PulsePlexConfig,
+    ShutdownMode,
+};
 
 #[derive(Parser)]
 #[command(
@@ -93,6 +99,10 @@ enum Commands {
         /// Force the interactive MIDI device selection prompt
         #[arg(short, long)]
         select_midi: bool,
+
+        /// Force the first-run setup wizard
+        #[arg(long)]
+        setup: bool,
     },
     /// Validate the configuration file and check for DMX collisions
     Check {
@@ -100,6 +110,23 @@ enum Commands {
         #[arg(short, long)]
         config: Option<String>,
     },
+    /// Run diagnostic tests for network and bridge connectivity
+    Doctor {
+        /// Path to configuration file
+        #[arg(short, long)]
+        config: Option<String>,
+    },
+    /// Template management
+    Template {
+        #[command(subcommand)]
+        action: TemplateAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TemplateAction {
+    /// Eject the default edrums configuration template to the current directory
+    Eject,
 }
 
 /// Helper to build a 512-channel DMX frame from intensities.
@@ -123,17 +150,17 @@ impl DmxFrameBuilder {
                     let g_val = (g as f32 * env.intensity) as u8;
                     let b_val = (b as f32 * env.intensity) as u8;
 
-                    if m.dmx_channel < 512 {
-                        frame[m.dmx_channel] = r_val;
+                    if m.channel < 512 {
+                        frame[m.channel] = r_val;
                     }
-                    if m.dmx_channel + 1 < 512 {
-                        frame[m.dmx_channel + 1] = g_val;
+                    if m.channel + 1 < 512 {
+                        frame[m.channel + 1] = g_val;
                     }
-                    if m.dmx_channel + 2 < 512 {
-                        frame[m.dmx_channel + 2] = b_val;
+                    if m.channel + 2 < 512 {
+                        frame[m.channel + 2] = b_val;
                     }
-                } else if m.dmx_channel < 512 {
-                    frame[m.dmx_channel] = env.dmx_value();
+                } else if m.channel < 512 {
+                    frame[m.channel] = env.dmx_value();
                 }
             }
         }
@@ -255,33 +282,76 @@ impl DashboardState {
 }
 
 fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Args::parse();
 
-    // Setup logging (verbose flag is global)
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(if cli.verbose { "trace" } else { "info" }));
+    // 1. Setup Rolling Logs
+    let log_dir = if let Some(proj_dirs) = ProjectDirs::from("org", "pulseplex", "pulseplex") {
+        proj_dirs.data_local_dir().join("logs")
+    } else {
+        PathBuf::from("logs")
+    };
+    std::fs::create_dir_all(&log_dir)?;
 
-    let registry = tracing_subscriber::registry().with(filter);
+    let file_appender = tracing_appender::rolling::daily(log_dir, "pulseplex.log");
+    let (non_blocking_file, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // 2. Setup logging (verbose flag is global)
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(if cli.verbose { "debug" } else { "info" }));
+
+    let registry = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_writer(non_blocking_file).with_ansi(false));
 
     if !cli.no_tui && std::io::stdout().is_terminal() {
-        // Redirect logs to stderr when TUI is active to avoid corrupting the screen
+        // Redirect terminal logs to stderr when TUI is active to avoid corrupting the screen
         registry.with(fmt::layer().with_writer(io::stderr)).init();
     } else {
         registry.with(fmt::layer()).init();
     }
+
+    // 3. Version Check in Background
+    std::thread::spawn(|| {
+        if let Err(e) = check_for_updates() {
+            debug!("Update check failed: {}", e);
+        }
+    });
+
     match cli.command.unwrap_or(Commands::Run {
         config: None,
         select_midi: false,
+        setup: false,
     }) {
         Commands::Check { config } => {
             let path = get_config_path(config.as_ref())?;
             handle_check(path.to_string_lossy().as_ref())?;
         }
+        Commands::Doctor { config } => {
+            let path = get_config_path(config.as_ref())?;
+            doctor::run_doctor(&path)?;
+        }
+        Commands::Template { action } => match action {
+            TemplateAction::Eject => {
+                let template_content = include_str!("../assets/default_edrums.toml");
+                let dest = PathBuf::from("pulseplex_edrums_template.toml");
+                std::fs::write(&dest, template_content)?;
+                println!("✅ Ejected default template to: {:?}", dest);
+            }
+        },
         Commands::Run {
             config,
             select_midi,
+            setup,
         } => {
             let path = get_config_path(config.as_ref())?;
+
+            let path = if setup || (!path.exists() && config.is_none()) {
+                // If default config doesn't exist or --setup is forced, run the wizard
+                setup::run_wizard().context("Failed to complete setup wizard")?
+            } else {
+                path
+            };
 
             // Ensure the configuration directory exists
             if let Some(parent) = path.parent() {
@@ -290,6 +360,43 @@ fn main() -> anyhow::Result<()> {
 
             run_daemon(path, select_midi, !cli.no_tui)?;
         }
+    }
+
+    Ok(())
+}
+
+fn check_for_updates() -> anyhow::Result<()> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("pulseplex-cli")
+        .timeout(Duration::from_secs(2))
+        .build()?;
+
+    let resp = client
+        .get("https://api.github.com/repos/pulseplex/pulseplex/releases/latest")
+        .send()?;
+
+    if !resp.status().is_success() {
+        return Ok(());
+    }
+
+    #[derive(serde::Deserialize)]
+    struct GithubRelease {
+        tag_name: String,
+    }
+
+    let body: serde_json::Value = resp.json()?;
+    let latest: GithubRelease = match serde_json::from_value(body.clone()) {
+        Ok(j) => j,
+        Err(e) => {
+            debug!("Failed to parse GitHub release JSON: {}. Body: {}", e, body);
+            return Ok(());
+        }
+    };
+    let current_v = semver::Version::parse(env!("CARGO_PKG_VERSION"))?;
+    let latest_v = semver::Version::parse(latest.tag_name.trim_start_matches('v'))?;
+
+    if latest_v > current_v {
+        println!("\x1b[33m⚠️  A new version of PulsePlex is available (v{}). Run 'brew upgrade pulseplex' to update.\x1b[0m", latest.tag_name);
     }
 
     Ok(())
@@ -405,7 +512,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                 info!("Initialized Art-Net sink for universe {}", artnet.universe);
             }
             TargetConfig::Hue(hue) => {
-                let hue_mappings = compiled
+                let hue_mappings: Vec<HueOutputMapping> = compiled
                     .hue_outputs
                     .iter()
                     .map(|h| HueOutputMapping {
@@ -414,15 +521,77 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                         color: h.color,
                     })
                     .collect();
-                let sink = HueSink::new(
+
+                // Attempt to initialize the Hue Sink
+                let sink_res = HueSink::new(
                     hue.bridge_ip.clone(),
                     hue.username.clone(),
                     hue.client_key.clone(),
                     hue.area_id.clone(),
-                    hue_mappings,
-                )?;
-                main_sink.add(Box::new(sink));
-                info!("Initialized Philips Hue sink for bridge {}", hue.bridge_ip);
+                    hue_mappings.clone(),
+                );
+
+                match sink_res {
+                    Ok(sink) => {
+                        main_sink.add(Box::new(sink));
+                        info!("Initialized Philips Hue sink for bridge {}", hue.bridge_ip);
+                    }
+                    Err(e) => {
+                        warn!("Failed to initialize Hue sink at {}: {}. Attempting auto-heal via mDNS...", hue.bridge_ip, e);
+
+                        // Extract Bridge ID from client_key (assuming it follows standard Hue format)
+                        // Standard Hue client keys are often hex, but the Bridge ID is also usually
+                        // discoverable if we just look for ANY bridge and see if it matches our credentials.
+                        // However, a better way is to use the Bridge ID if we had it.
+                        // Let's try to discover any bridge and see if it responds to our username.
+                        // For now, let's assume we can find it if we search for the bridge_id if we had it.
+                        // Since we don't store Bridge ID explicitly yet, let's try to find ONE bridge
+                        // on the network and see if its IP changed.
+
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        let new_ip = rt.block_on(async {
+                            // Targeted discovery via Bridge ID to handle DHCP IP changes
+                            setup::discover_bridge_by_id_fallback(&hue.bridge_id).await
+                        });
+
+                        if let Ok(ip) = new_ip {
+                            let ip_str = ip.to_string();
+                            info!(
+                                "Auto-heal: Found Hue Bridge at new IP: {}. Updating config...",
+                                ip_str
+                            );
+
+                            // Update the config file
+                            if let Err(e) = update_hue_ip_in_config(&config_path_str, &ip_str) {
+                                error!("Auto-heal failed to update config file: {}", e);
+                            }
+
+                            // Retry sink creation with new IP
+                            match HueSink::new(
+                                ip_str,
+                                hue.username.clone(),
+                                hue.client_key.clone(),
+                                hue.area_id.clone(),
+                                hue_mappings,
+                            ) {
+                                Ok(sink) => {
+                                    main_sink.add(Box::new(sink));
+                                    info!("Auto-heal successful. Hue sink initialized.");
+                                }
+                                Err(retry_e) => {
+                                    error!(
+                                        "Auto-heal failed to initialize sink even with new IP: {}",
+                                        retry_e
+                                    );
+                                }
+                            }
+                        } else {
+                            error!("Auto-heal: Could not find Hue Bridge on the network.");
+                        }
+                    }
+                }
             }
         }
     }
@@ -751,8 +920,7 @@ fn perform_shutdown(
                         // For RGB, check all 3 channels and derive max intensity relative to base color
                         for (offset, &base_val) in base_color.iter().enumerate() {
                             if base_val > 0 {
-                                if let Some(&default_val) = defaults.get(&(m.dmx_channel + offset))
-                                {
+                                if let Some(&default_val) = defaults.get(&(m.channel + offset)) {
                                     let intensity = default_val as f32 / base_val as f32;
                                     max_intensity = max_intensity.max(intensity);
                                 }
@@ -760,7 +928,7 @@ fn perform_shutdown(
                         }
                     } else {
                         // For grayscale, just check the single channel
-                        if let Some(&default_val) = defaults.get(&m.dmx_channel) {
+                        if let Some(&default_val) = defaults.get(&m.channel) {
                             max_intensity = default_val as f32 / 255.0;
                         }
                     }
@@ -785,13 +953,13 @@ fn perform_shutdown(
                 if let Some(base_color) = m.color {
                     for (offset, &base_val) in base_color.iter().enumerate() {
                         if base_val > 0 {
-                            if let Some(&captured_val) = initial_state.get(m.dmx_channel + offset) {
+                            if let Some(&captured_val) = initial_state.get(m.channel + offset) {
                                 let intensity = captured_val as f32 / base_val as f32;
                                 max_intensity = max_intensity.max(intensity);
                             }
                         }
                     }
-                } else if let Some(&captured_val) = initial_state.get(m.dmx_channel) {
+                } else if let Some(&captured_val) = initial_state.get(m.channel) {
                     max_intensity = captured_val as f32 / 255.0;
                 }
 
@@ -1012,12 +1180,12 @@ mod tests {
         let mappings = vec![
             DmxOutputCompiled {
                 internal_id: 1,
-                dmx_channel: 0,
+                channel: 0,
                 color: None,
             },
             DmxOutputCompiled {
                 internal_id: 2,
-                dmx_channel: 5,
+                channel: 5,
                 color: Some([255, 128, 0]),
             },
         ];
@@ -1049,12 +1217,12 @@ mod tests {
         let dmx_outputs = vec![
             DmxOutputCompiled {
                 internal_id: 100,
-                dmx_channel: 0,
+                channel: 0,
                 color: None,
             },
             DmxOutputCompiled {
                 internal_id: 101,
-                dmx_channel: 10,
+                channel: 10,
                 color: Some([200, 0, 0]),
             },
         ];
@@ -1094,12 +1262,12 @@ mod tests {
         let dmx_outputs = vec![
             DmxOutputCompiled {
                 internal_id: 200,
-                dmx_channel: 5,
+                channel: 5,
                 color: None,
             },
             DmxOutputCompiled {
                 internal_id: 201,
-                dmx_channel: 10,
+                channel: 10,
                 color: Some([0, 255, 0]),
             },
         ];

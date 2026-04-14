@@ -4,12 +4,22 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
+[features]
+default = ["streaming"]
+streaming = ["dep:webrtc-dtls"]
+
 [dependencies]
 pulseplex-core = { workspace = true }
 anyhow = { workspace = true }
 crossbeam-channel = { workspace = true }
 tracing = { workspace = true }
 tokio = { version = "1.43.0", features = ["full"] }
-webrtc-dtls = "0.10.0"
+webrtc-dtls = { version = "0.10.0", optional = true }
 byteorder = "1.5.0"
 hex = "0.4.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde_json = "1.0"
+serde = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = "2.1"
+rustls-pki_types = { version = "1.10", package = "rustls-pki-types" }

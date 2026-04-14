@@ -76,6 +76,23 @@ pub fn process_tick(rx: &Receiver<Signal>) {
 }
 ```
 
+## Troubleshooting & Anti-Loop Protocol
+
+If an error persists after 2 repair attempts, you MUST STOP writing code and
+execute the following protocol:
+
+1. **Acknowledge the Loop:** Explicitly state that the current approach is
+   failing.
+2. **Environment Check:** Is the error coming from our code, a dependency, or
+   the OS? (Run `cargo tree`, `rustc --version`, or check environment variables
+   if you have terminal execution capabilities).
+3. **Web Research:** You MUST use your web search or browser tool to search for
+   the EXACT error string (e.g., "The validity period in the certificate exceeds
+   the maximum allowed reqwest rust"). Do not guess; read GitHub issues or
+   StackOverflow.
+4. **Propose a Paradigm Shift:** Before writing new code, propose a completely
+   different architectural approach to bypassing the error.
+
 ## Boundaries
 
 - ✅ **Always:** Run `just all` before creating a commit. Write black-box

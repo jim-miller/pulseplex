@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{unbounded, Receiver, TryRecvError};
 use midir::{MidiInput, MidiInputConnection, MidiInputPort};
 use pulseplex_core::{EventSource, Signal};
-use tracing::info;
+use tracing::{debug, info};
 
 pub struct MidiReceiver {
     rx: Receiver<Signal>,
@@ -81,7 +81,13 @@ pub fn setup_midi(target_device: &str, id_map: HashMap<u8, usize>) -> anyhow::Re
                     let note = message[1];
                     let velocity = message[2];
 
+                    debug!(
+                        "MIDI Event: status={:#04x}, note={}, velocity={}",
+                        status, note, velocity
+                    );
+
                     if let Some(&internal_id) = id_map.get(&note) {
+                        debug!("MIDI Note {} mapped to internal_id={}", note, internal_id);
                         match status {
                             0x90 if velocity > 0 => {
                                 let _ = tx.send(Signal::Trigger {
