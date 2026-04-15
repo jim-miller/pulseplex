@@ -286,7 +286,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Args::parse();
 
     // 1. Setup Rolling Logs
-    let log_dir = if let Some(proj_dirs) = ProjectDirs::from("org", "pulseplex", "pulseplex") {
+    let log_dir = if let Some(proj_dirs) = ProjectDirs::from("", "", "PulsePlex") {
         proj_dirs.data_local_dir().join("logs")
     } else {
         PathBuf::from("logs")

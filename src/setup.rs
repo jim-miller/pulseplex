@@ -75,7 +75,7 @@ pub fn run_wizard() -> Result<PathBuf> {
         .replace("{client_key}", &client_key)
         .replace("{area_id}", &area_id);
 
-    let proj_dirs = ProjectDirs::from("org", "pulseplex", "pulseplex")
+    let proj_dirs = ProjectDirs::from("", "", "PulsePlex")
         .ok_or_else(|| anyhow!("Could not determine configuration directory"))?;
     let config_dir = proj_dirs.config_dir();
     std::fs::create_dir_all(config_dir)?;
