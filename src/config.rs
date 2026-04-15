@@ -181,9 +181,9 @@ impl PulsePlexConfig {
 
         let mut targets = self.targets.clone();
         if let Some(artnet) = &self.output.artnet {
-            let has_equivalent_artnet_target = targets
-                .iter()
-                .any(|target| matches!(target, TargetConfig::ArtNet(existing) if existing == artnet));
+            let has_equivalent_artnet_target = targets.iter().any(
+                |target| matches!(target, TargetConfig::ArtNet(existing) if existing == artnet),
+            );
             if !has_equivalent_artnet_target {
                 targets.push(TargetConfig::ArtNet(artnet.clone()));
             }
