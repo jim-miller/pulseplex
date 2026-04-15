@@ -4,39 +4,43 @@
 
 [midi]
 device_name = "{midi_device}"
-mappings = { 38 = "snare", 36 = "kick", 46 = "hihat_open", 42 = "hihat_closed" }
+mappings = { 38 = "snare", 35 = "kick", 46 = "hihat_closed", 49 = "crash_cymbal" }
 
 [[behavior]]
 id = "snare"
-decay_seconds = 0.25
-velocity_curve = "soft"
-decay_profile = "exponential"
+decay_seconds = 1.25
+velocity_curve = "linear"
+decay_profile = "linear"
+color = [255, 196, 0]
 
 [[behavior]]
 id = "kick"
-decay_seconds = 0.35
-velocity_curve = "hard"
+decay_seconds = 3.35
+velocity_curve = "soft"
 decay_profile = "exponential"
-
-[[behavior]]
-id = "hihat_open"
-decay_seconds = 0.5
-velocity_curve = "linear"
-decay_profile = "exponential"
+color = [220, 9, 47]
 
 [[behavior]]
 id = "hihat_closed"
-decay_seconds = 0.05
-velocity_curve = "linear"
+decay_seconds = 0.25
+velocity_curve = "hard"
 decay_profile = "linear"
+color = [185, 112, 227]
+
+[[behavior]]
+id = "crash_cymbal"
+decay_seconds = 3.0
+velocity_curve = "hard"
+decay_profile = "exponential"
+color = [255, 255, 255]
 
 [output]
 dmx = []
 hue = [
-    { id = "snare", channel_id = 0, color = [255, 0, 0] },
-    { id = "kick", channel_id = 1, color = [0, 0, 255] },
-    { id = "hihat_open", channel_id = 2, color = [255, 255, 0] },
-    { id = "hihat_closed", channel_id = 3, color = [255, 255, 255] }
+  { id = "snare", channel_id = 0 },
+  { id = "kick", channel_id = 1 },
+  { id = "hihat_closed", channel_id = 2 },
+  { id = "crash_cymbal", channel_id = 3 },
 ]
 
 [[targets]]
