@@ -11,36 +11,32 @@ id = "snare"
 decay_seconds = 1.25
 velocity_curve = "linear"
 decay_profile = "linear"
-color = [255, 196, 0]
 
 [[behavior]]
 id = "kick"
 decay_seconds = 3.35
 velocity_curve = "soft"
 decay_profile = "exponential"
-color = [220, 9, 47]
 
 [[behavior]]
 id = "hihat_closed"
 decay_seconds = 0.25
 velocity_curve = "hard"
 decay_profile = "linear"
-color = [185, 112, 227]
 
 [[behavior]]
 id = "crash_cymbal"
 decay_seconds = 3.0
 velocity_curve = "hard"
 decay_profile = "exponential"
-color = [255, 255, 255]
 
 [output]
 dmx = []
 hue = [
-  { id = "snare", channel_id = 0 },
-  { id = "kick", channel_id = 1 },
-  { id = "hihat_closed", channel_id = 2 },
-  { id = "crash_cymbal", channel_id = 3 },
+  { id = "snare", channel_id = 0, color = [255, 196, 0] },
+  { id = "kick", channel_id = 1, color = [220, 9, 47] },
+  { id = "hihat_closed", channel_id = 2, color = [185, 112, 227] },
+  { id = "crash_cymbal", channel_id = 3, color = [255, 255, 255] },
 ]
 
 [[targets]]

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
@@ -31,7 +31,6 @@ pub struct BehaviorDefinition {
     pub velocity_curve: pulseplex_core::VelocityCurve,
     #[serde(default)]
     pub decay_profile: pulseplex_core::DecayProfile,
-    pub color: Option<[u8; 3]>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
@@ -46,12 +45,14 @@ pub struct OutputConfig {
 pub struct DmxOutputDefinition {
     pub id: String,
     pub channel: usize,
+    pub color: Option<[u8; 3]>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct HueOutputDefinition {
     pub id: String,
     pub channel_id: u8,
+    pub color: Option<[u8; 3]>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
@@ -125,47 +126,31 @@ impl PulsePlexConfig {
     }
 
     pub fn compile(&self) -> Result<CompiledConfig> {
-        let mut midi_id_map = HashMap::new();
-        let mut behaviors = HashMap::new();
         let mut id_to_internal = HashMap::new();
-        let mut next_internal_id = 0;
+        let mut behaviors = HashMap::new();
 
-        // Verify all mappings point to existing behaviors
-        let behavior_ids: HashSet<_> = self.behavior.iter().map(|b| b.id.as_str()).collect();
+        for (internal_id, b) in self.behavior.iter().enumerate() {
+            id_to_internal.insert(b.id.clone(), internal_id);
 
+            behaviors.insert(
+                internal_id,
+                BehaviorConfig {
+                    decay_seconds: b.decay_seconds,
+                    velocity_curve: b.velocity_curve,
+                    decay_profile: b.decay_profile,
+                },
+            );
+        }
+
+        let mut midi_id_map = HashMap::new();
         for (midi_note, behavior_id) in &self.midi.mappings {
-            if !behavior_ids.contains(behavior_id.as_str()) {
+            if let Some(internal_id) = id_to_internal.get(behavior_id) {
+                midi_id_map.insert(*midi_note, *internal_id);
+            } else {
                 bail!(
                     "MIDI mapping for note {} points to non-existent behavior '{}'",
                     midi_note,
                     behavior_id
-                );
-            }
-
-            let internal_id = *id_to_internal
-                .entry(behavior_id.clone())
-                .or_insert_with(|| {
-                    let id = next_internal_id;
-                    next_internal_id += 1;
-                    id
-                });
-
-            midi_id_map.insert(*midi_note, internal_id);
-        }
-
-        let mut behavior_colors = HashMap::new();
-
-        for b in &self.behavior {
-            if let Some(internal_id) = id_to_internal.get(&b.id) {
-                behavior_colors.insert(*internal_id, b.color);
-
-                behaviors.insert(
-                    *internal_id,
-                    BehaviorConfig {
-                        decay_seconds: b.decay_seconds,
-                        velocity_curve: b.velocity_curve,
-                        decay_profile: b.decay_profile,
-                    },
                 );
             }
         }
@@ -173,12 +158,10 @@ impl PulsePlexConfig {
         let mut dmx_outputs = Vec::new();
         for d in &self.output.dmx {
             if let Some(internal_id) = id_to_internal.get(&d.id) {
-                let color = behavior_colors.get(internal_id).copied().flatten();
-
                 dmx_outputs.push(DmxOutputCompiled {
                     internal_id: *internal_id,
                     channel: d.channel,
-                    color,
+                    color: d.color,
                 });
             }
         }
@@ -186,13 +169,17 @@ impl PulsePlexConfig {
         let mut hue_outputs = Vec::new();
         for h in &self.output.hue {
             if let Some(internal_id) = id_to_internal.get(&h.id) {
-                let color = behavior_colors.get(internal_id).copied().flatten();
                 hue_outputs.push(HueOutputCompiled {
                     internal_id: *internal_id,
                     channel_id: h.channel_id,
-                    color,
+                    color: h.color,
                 });
             }
+        }
+
+        let mut targets = self.targets.clone();
+        if let Some(artnet) = &self.output.artnet {
+            targets.push(TargetConfig::ArtNet(artnet.clone()));
         }
 
         Ok(CompiledConfig {
@@ -201,7 +188,7 @@ impl PulsePlexConfig {
             behaviors,
             dmx_outputs,
             hue_outputs,
-            targets: self.targets.clone(),
+            targets,
         })
     }
 }
