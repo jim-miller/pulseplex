@@ -1036,8 +1036,7 @@ fn handle_check(path: &str) -> anyhow::Result<()> {
     let mut used_channels = HashMap::new();
     let mut errors = false;
     for dmx in &config.output.dmx {
-        // let span = if dmx.color.is_some() { 3 } else { 1 };
-        let span = 1;
+        let span = if dmx.color.is_some() { 3 } else { 1 };
         for offset in 0..span {
             let channel = dmx.channel + offset;
             if channel > 511 {

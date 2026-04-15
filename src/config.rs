@@ -130,7 +130,9 @@ impl PulsePlexConfig {
         let mut behaviors = HashMap::new();
 
         for (internal_id, b) in self.behavior.iter().enumerate() {
-            id_to_internal.insert(b.id.clone(), internal_id);
+            if id_to_internal.insert(b.id.clone(), internal_id).is_some() {
+                bail!("Duplicate behavior id '{}' in configuration", b.id);
+            }
 
             behaviors.insert(
                 internal_id,
@@ -179,7 +181,12 @@ impl PulsePlexConfig {
 
         let mut targets = self.targets.clone();
         if let Some(artnet) = &self.output.artnet {
-            targets.push(TargetConfig::ArtNet(artnet.clone()));
+            let has_equivalent_artnet_target = targets
+                .iter()
+                .any(|target| matches!(target, TargetConfig::ArtNet(existing) if existing == artnet));
+            if !has_equivalent_artnet_target {
+                targets.push(TargetConfig::ArtNet(artnet.clone()));
+            }
         }
 
         Ok(CompiledConfig {
