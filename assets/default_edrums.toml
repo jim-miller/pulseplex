@@ -47,10 +47,11 @@ username = "{username}"
 client_key = "{client_key}"
 area_id = "{area_id}"
 
-[[targets]]
-type = "artnet"
-target_ip = "127.0.0.1:6454"
-universe = 0
+# Uncomment to enable Art-Net output after adding explicit [output].dmx mappings.
+# [[targets]]
+# type = "artnet"
+# target_ip = "127.0.0.1:6454"
+# universe = 0
 
 [shutdown]
 mode = "blackout"
