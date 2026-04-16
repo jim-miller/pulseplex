@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
@@ -126,43 +126,33 @@ impl PulsePlexConfig {
     }
 
     pub fn compile(&self) -> Result<CompiledConfig> {
-        let mut midi_id_map = HashMap::new();
-        let mut behaviors = HashMap::new();
         let mut id_to_internal = HashMap::new();
-        let mut next_internal_id = 0;
+        let mut behaviors = HashMap::new();
 
-        // Verify all mappings point to existing behaviors
-        let behavior_ids: HashSet<_> = self.behavior.iter().map(|b| b.id.as_str()).collect();
+        for (internal_id, b) in self.behavior.iter().enumerate() {
+            if id_to_internal.insert(b.id.clone(), internal_id).is_some() {
+                bail!("Duplicate behavior id '{}' in configuration", b.id);
+            }
 
+            behaviors.insert(
+                internal_id,
+                BehaviorConfig {
+                    decay_seconds: b.decay_seconds,
+                    velocity_curve: b.velocity_curve,
+                    decay_profile: b.decay_profile,
+                },
+            );
+        }
+
+        let mut midi_id_map = HashMap::new();
         for (midi_note, behavior_id) in &self.midi.mappings {
-            if !behavior_ids.contains(behavior_id.as_str()) {
+            if let Some(internal_id) = id_to_internal.get(behavior_id) {
+                midi_id_map.insert(*midi_note, *internal_id);
+            } else {
                 bail!(
                     "MIDI mapping for note {} points to non-existent behavior '{}'",
                     midi_note,
                     behavior_id
-                );
-            }
-
-            let internal_id = *id_to_internal
-                .entry(behavior_id.clone())
-                .or_insert_with(|| {
-                    let id = next_internal_id;
-                    next_internal_id += 1;
-                    id
-                });
-
-            midi_id_map.insert(*midi_note, internal_id);
-        }
-
-        for b in &self.behavior {
-            if let Some(internal_id) = id_to_internal.get(&b.id) {
-                behaviors.insert(
-                    *internal_id,
-                    BehaviorConfig {
-                        decay_seconds: b.decay_seconds,
-                        velocity_curve: b.velocity_curve,
-                        decay_profile: b.decay_profile,
-                    },
                 );
             }
         }
@@ -189,13 +179,23 @@ impl PulsePlexConfig {
             }
         }
 
+        let mut targets = self.targets.clone();
+        if let Some(artnet) = &self.output.artnet {
+            let has_equivalent_artnet_target = targets.iter().any(
+                |target| matches!(target, TargetConfig::ArtNet(existing) if existing == artnet),
+            );
+            if !has_equivalent_artnet_target {
+                targets.push(TargetConfig::ArtNet(artnet.clone()));
+            }
+        }
+
         Ok(CompiledConfig {
             midi_device: self.midi.device_name.clone(),
             midi_id_map,
             behaviors,
             dmx_outputs,
             hue_outputs,
-            targets: self.targets.clone(),
+            targets,
         })
     }
 }
@@ -282,7 +282,7 @@ pub fn get_config_path(cli_override: Option<&String>) -> Result<PathBuf> {
         return Ok(local_config);
     }
 
-    let proj_dirs = ProjectDirs::from("org", "pulseplex", "pulseplex")
+    let proj_dirs = ProjectDirs::from("", "", "PulsePlex")
         .ok_or_else(|| anyhow::anyhow!("Could not determine configuration directory"))?;
 
     Ok(proj_dirs.config_dir().join("pulseplex.toml"))

@@ -3,8 +3,8 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
-authors = ["PulsePlex <contact@pulseplex.org>"]
+version = "0.1.0"
+authors = ["PulsePlex <contact@pulseplex.net>"]
 edition = "2021"
 
 [package]
@@ -30,11 +30,11 @@ ctrlc = "3.5.2"
 notify = "8.2.0"
 dialoguer = "0.12.0"
 toml_edit = "0.25.8"
-ratatui = "0.29.0"
-crossterm = "0.28.1"
+ratatui = "0.30.0"
+crossterm = "0.29.0"
 # Force reqwest to use rustls to bypass macOS Security.framework limitations
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
-mdns-sd = "0.13"
+mdns-sd = "0.14"
 directories = "6.0"
 # Add 'time' feature for timeouts and sleeps
 tokio = { version = "1.43", features = ["rt", "macros", "time"] }
