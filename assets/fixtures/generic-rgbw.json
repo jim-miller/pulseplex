@@ -1,0 +1,31 @@
+{
+  "name": "Generic RGBW Fixture",
+  "availableChannels": {
+    "Red": {
+      "capabilities": [
+        { "dmxRange": [0, 255], "type": "ColorIntensity", "color": "Red" }
+      ]
+    },
+    "Green": {
+      "capabilities": [
+        { "dmxRange": [0, 255], "type": "ColorIntensity", "color": "Green" }
+      ]
+    },
+    "Blue": {
+      "capabilities": [
+        { "dmxRange": [0, 255], "type": "ColorIntensity", "color": "Blue" }
+      ]
+    },
+    "White": {
+      "capabilities": [
+        { "dmxRange": [0, 255], "type": "ColorIntensity", "color": "White" }
+      ]
+    }
+  },
+  "modes": [
+    {
+      "name": "4-channel",
+      "channels": ["Red", "Green", "Blue", "White"]
+    }
+  ]
+}

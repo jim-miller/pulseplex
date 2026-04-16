@@ -3,9 +3,27 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use anyhow::{bail, Result};
-use pulseplex_core::BehaviorConfig;
+use pulseplex_core::{
+    fixture::{FixtureInstance, OflFixture},
+    BehaviorConfig,
+};
 use serde::Deserialize;
 use toml_edit::{value, DocumentMut};
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct FixtureDefinition {
+    pub id: String,
+    pub profile_path: String,
+    pub mode: String,
+    pub start_address: u16,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct FixtureMappingDefinition {
+    pub behavior_id: String,
+    pub fixture_id: String,
+    pub capability: pulseplex_core::fixture::CapabilityType,
+}
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct PulsePlexConfig {
@@ -15,6 +33,12 @@ pub struct PulsePlexConfig {
     #[serde(default)]
     pub targets: Vec<TargetConfig>,
     pub shutdown: ShutdownConfig,
+    #[serde(default)]
+    pub fixtures: Vec<FixtureDefinition>,
+    #[serde(default)]
+    pub fixture_mappings: Vec<FixtureMappingDefinition>,
+    #[serde(skip)]
+    pub base_dir: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
@@ -37,21 +61,12 @@ pub struct BehaviorDefinition {
 pub struct OutputConfig {
     pub artnet: Option<ArtNetConfig>,
     pub dmx: Vec<DmxOutputDefinition>,
-    #[serde(default)]
-    pub hue: Vec<HueOutputDefinition>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct DmxOutputDefinition {
     pub id: String,
     pub channel: usize,
-    pub color: Option<[u8; 3]>,
-}
-
-#[derive(Deserialize, Debug, Clone, PartialEq)]
-pub struct HueOutputDefinition {
-    pub id: String,
-    pub channel_id: u8,
     pub color: Option<[u8; 3]>,
 }
 
@@ -75,6 +90,14 @@ pub struct HueConfig {
     pub username: String,
     pub client_key: String,
     pub area_id: String,
+    #[serde(default)]
+    pub patch: Vec<HuePatch>,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct HuePatch {
+    pub hue_id: u8,
+    pub dmx_address: u16,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -100,8 +123,9 @@ pub struct CompiledConfig {
     pub midi_id_map: HashMap<u8, usize>,
     pub behaviors: HashMap<usize, BehaviorConfig>,
     pub dmx_outputs: Vec<DmxOutputCompiled>,
-    pub hue_outputs: Vec<HueOutputCompiled>,
     pub targets: Vec<TargetConfig>,
+    pub fixtures: Vec<FixtureInstance>,
+    pub fixture_mappings: HashMap<usize, Vec<(usize, pulseplex_core::fixture::CapabilityType)>>,
 }
 
 #[derive(Clone)]
@@ -111,17 +135,11 @@ pub struct DmxOutputCompiled {
     pub color: Option<[u8; 3]>,
 }
 
-#[derive(Clone)]
-pub struct HueOutputCompiled {
-    pub internal_id: usize,
-    pub channel_id: u8,
-    pub color: Option<[u8; 3]>,
-}
-
 impl PulsePlexConfig {
     pub fn load(path: &str) -> Result<Self> {
         let content = fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&content)?;
+        let mut config: Self = toml::from_str(&content)?;
+        config.base_dir = Path::new(path).parent().map(|p| p.to_path_buf());
         Ok(config)
     }
 
@@ -168,17 +186,6 @@ impl PulsePlexConfig {
             }
         }
 
-        let mut hue_outputs = Vec::new();
-        for h in &self.output.hue {
-            if let Some(internal_id) = id_to_internal.get(&h.id) {
-                hue_outputs.push(HueOutputCompiled {
-                    internal_id: *internal_id,
-                    channel_id: h.channel_id,
-                    color: h.color,
-                });
-            }
-        }
-
         let mut targets = self.targets.clone();
         if let Some(artnet) = &self.output.artnet {
             let has_equivalent_artnet_target = targets.iter().any(
@@ -189,13 +196,89 @@ impl PulsePlexConfig {
             }
         }
 
+        let mut fixtures = Vec::new();
+        let mut fixture_id_to_index = HashMap::new();
+        for (idx, f_def) in self.fixtures.iter().enumerate() {
+            if f_def.start_address < 1 {
+                bail!("Fixture {} start_address must be >= 1", f_def.id);
+            }
+
+            let mut profile_path = PathBuf::from(&f_def.profile_path);
+            if profile_path.is_relative() {
+                if let Some(base) = &self.base_dir {
+                    profile_path = base.join(profile_path);
+                }
+            }
+
+            let profile_content = fs::read_to_string(&profile_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to read fixture profile at {:?}: {}",
+                    profile_path,
+                    e
+                )
+            })?;
+            let profile: OflFixture = serde_json::from_str(&profile_content).map_err(|e| {
+                anyhow::anyhow!("Malformed fixture JSON at {:?}: {}", profile_path, e)
+            })?;
+
+            // Footprint validation
+            let footprint = profile
+                .modes
+                .iter()
+                .find(|m| m.name == f_def.mode)
+                .map(|m| m.channels.len())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Mode '{}' not found in profile for {}",
+                        f_def.mode,
+                        f_def.id
+                    )
+                })?;
+
+            if f_def.start_address as usize + footprint - 1 > 512 {
+                bail!("Fixture {} exceeds 512 channel universe", f_def.id);
+            }
+
+            let instance = FixtureInstance::from_ofl(
+                f_def.id.clone(),
+                &profile,
+                &f_def.mode,
+                f_def.start_address,
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to instantiate fixture '{}': {}", f_def.id, e))?;
+
+            fixtures.push(instance);
+            if fixture_id_to_index.insert(f_def.id.clone(), idx).is_some() {
+                bail!("Duplicate fixture id '{}'", f_def.id);
+            }
+        }
+
+        let mut fixture_mappings: HashMap<
+            usize,
+            Vec<(usize, pulseplex_core::fixture::CapabilityType)>,
+        > = HashMap::new();
+        for m in &self.fixture_mappings {
+            let b_internal_id = id_to_internal.get(&m.behavior_id).ok_or_else(|| {
+                anyhow::anyhow!("Fixture mapping behavior_id '{}' not found", m.behavior_id)
+            })?;
+            let f_idx = fixture_id_to_index.get(&m.fixture_id).ok_or_else(|| {
+                anyhow::anyhow!("Fixture mapping fixture_id '{}' not found", m.fixture_id)
+            })?;
+
+            fixture_mappings
+                .entry(*b_internal_id)
+                .or_default()
+                .push((*f_idx, m.capability));
+        }
+
         Ok(CompiledConfig {
             midi_device: self.midi.device_name.clone(),
             midi_id_map,
             behaviors,
             dmx_outputs,
-            hue_outputs,
             targets,
+            fixtures,
+            fixture_mappings,
         })
     }
 }

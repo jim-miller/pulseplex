@@ -11,7 +11,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{channel, Receiver as AsyncReceiver, Sender as AsyncSender};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "streaming")]
 use webrtc_dtls::config::Config;
@@ -110,18 +110,18 @@ impl ServerCertVerifier for HueCertVerifier {
 }
 
 /// Compiled mapping for a single Hue light channel in an Entertainment Area.
-#[derive(Clone, Debug)]
-pub struct HueOutputMapping {
-    pub internal_id: usize,
-    pub channel_id: u8,
-    pub color: Option<[u8; 3]>,
+#[derive(Clone, Debug, serde::Deserialize, PartialEq)]
+pub struct HuePatch {
+    pub hue_id: u8,
+    pub dmx_address: u16,
 }
 
 pub struct HueSink {
-    tx: AsyncSender<Vec<f32>>,
-    pool_tx: Sender<Vec<f32>>,
-    pool_rx: Receiver<Vec<f32>>,
-    mappings: Vec<HueOutputMapping>,
+    tx: AsyncSender<[u8; 512]>,
+    pool_tx: Sender<[u8; 512]>,
+    pool_rx: Receiver<[u8; 512]>,
+    #[allow(dead_code)]
+    patch: Vec<HuePatch>,
 }
 
 impl HueSink {
@@ -130,11 +130,27 @@ impl HueSink {
         username: String,
         client_key: String,
         area_id: String,
-        mappings: Vec<HueOutputMapping>,
+        patch: Vec<HuePatch>,
     ) -> Result<Self> {
         if area_id.len() != 36 {
             return Err(anyhow!("Hue area_id must be exactly 36 characters (UUID)"));
         }
+
+        // Filter valid patches
+        let filtered_patch: Vec<HuePatch> = patch
+            .into_iter()
+            .filter(|p| {
+                if p.dmx_address < 1 || p.dmx_address + 2 > 512 {
+                    warn!(
+                        "Dropped invalid Hue patch: dmx_address {} is out of bounds (1-512)",
+                        p.dmx_address
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
 
         // Forward channel: Hot loop -> Background thread
         let (tx, rx) = channel(1);
@@ -143,12 +159,11 @@ impl HueSink {
         let (pool_tx, pool_rx) = bounded(2);
 
         // Pre-seed the pool with 2 buffers
-        let mapping_count = mappings.len();
         for _ in 0..2 {
-            pool_tx.send(vec![0.0; mapping_count]).unwrap();
+            pool_tx.send([0u8; 512]).unwrap();
         }
 
-        let background_mappings = mappings.clone();
+        let background_patch = filtered_patch.clone();
         let pool_tx_clone = pool_tx.clone();
 
         // Construct runtime before spawning to surface errors
@@ -169,7 +184,7 @@ impl HueSink {
                     username,
                     client_key,
                     area_id,
-                    background_mappings,
+                    background_patch,
                     rx,
                     pool_tx_clone,
                 )
@@ -184,26 +199,18 @@ impl HueSink {
             tx,
             pool_tx,
             pool_rx,
-            mappings,
+            patch: filtered_patch,
         })
     }
 }
 
 impl LightSink for HueSink {
-    fn send_state(&mut self, intensities: &HashMap<usize, DecayEnvelope>) -> anyhow::Result<()> {
+    fn send_universe(&mut self, universe: &[u8; 512]) -> anyhow::Result<()> {
         // 1. Try to get a buffer from the pool (zero allocation)
-        let mut buffer = self
-            .pool_rx
-            .try_recv()
-            .unwrap_or_else(|_| vec![0.0; self.mappings.len()]);
+        let mut buffer = self.pool_rx.try_recv().unwrap_or([0u8; 512]);
 
         // 2. Fill the buffer
-        for (idx, m) in self.mappings.iter().enumerate() {
-            buffer[idx] = intensities
-                .get(&m.internal_id)
-                .map(|env| env.intensity)
-                .unwrap_or(0.0);
-        }
+        buffer.copy_from_slice(universe);
 
         // 3. Try send to background thread (non-blocking)
         if let Err(err) = self.tx.try_send(buffer) {
@@ -220,6 +227,10 @@ impl LightSink for HueSink {
 
         Ok(())
     }
+
+    fn send_state(&mut self, _intensities: &HashMap<usize, DecayEnvelope>) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 async fn run_hue_background(
@@ -227,9 +238,9 @@ async fn run_hue_background(
     username: String,
     client_key: String,
     area_id: String,
-    mappings: Vec<HueOutputMapping>,
-    mut rx: AsyncReceiver<Vec<f32>>,
-    pool_tx: Sender<Vec<f32>>,
+    patch: Vec<HuePatch>,
+    mut rx: AsyncReceiver<[u8; 512]>,
+    pool_tx: Sender<[u8; 512]>,
 ) -> Result<()> {
     info!("Starting Hue background thread for bridge {}", bridge_ip);
 
@@ -285,7 +296,7 @@ async fn run_hue_background(
             .send()
             .await?;
 
-        let mut valid_indices: Vec<usize> = (0..mappings.len()).collect();
+        let mut valid_indices: Vec<usize> = (0..patch.len()).collect();
 
         if area_resp.status().is_success() {
             let details: serde_json::Value = area_resp.json().await?;
@@ -318,12 +329,12 @@ async fn run_hue_background(
 
                         // Validate our config against the bridge and build the filter
                         valid_indices.retain(|&idx| {
-                            let m = &mappings[idx];
-                            if valid_ids.contains(&m.channel_id) {
-                                debug!("Mapping confirmed: logic_id {} -> physical channel {}", m.internal_id, m.channel_id);
+                            let p = &patch[idx];
+                            if valid_ids.contains(&p.hue_id) {
+                                debug!("Mapping confirmed: DMX address {} -> physical channel {}", p.dmx_address, p.hue_id);
                                 true
                             } else {
-                                warn!("Degraded Experience: Config maps ID {} to invalid channel_id {}. This light will be STRIPPED from the stream.", m.internal_id, m.channel_id);
+                                warn!("Degraded Experience: Config maps DMX address {} to invalid channel_id {}. This light will be STRIPPED from the stream.", p.dmx_address, p.hue_id);
                                 false
                             }
                         });
@@ -401,7 +412,7 @@ async fn run_hue_background(
 
             match stream_to_hue(
                 dtls_conn,
-                &mappings,
+                &patch,
                 &valid_indices,
                 &mut rx,
                 &pool_tx,
@@ -429,17 +440,17 @@ async fn run_hue_background(
 #[cfg(feature = "streaming")]
 async fn stream_to_hue(
     conn: DTLSConn,
-    mappings: &[HueOutputMapping],
+    patch: &[HuePatch],
     valid_indices: &[usize],
-    rx: &mut AsyncReceiver<Vec<f32>>,
-    pool_tx: &Sender<Vec<f32>>,
+    rx: &mut AsyncReceiver<[u8; 512]>,
+    pool_tx: &Sender<[u8; 512]>,
     area_id: &str,
 ) -> Result<()> {
     let mut sequence: u8 = 0;
 
     loop {
-        let intensities = match rx.recv().await {
-            Some(i) => i,
+        let universe = match rx.recv().await {
+            Some(u) => u,
             None => {
                 info!("Channel closed. Sending close_notify to Hue Bridge...");
                 let _ = conn.close().await;
@@ -447,29 +458,21 @@ async fn stream_to_hue(
             }
         };
 
-        let buf = build_huestream_packet(&intensities, mappings, valid_indices, sequence, area_id)?;
+        let buf = build_huestream_packet(&universe, patch, valid_indices, sequence, area_id)?;
         sequence = sequence.wrapping_add(1);
 
-        if intensities.iter().any(|&v| v > 0.0) {
-            trace!(
-                "Sending non-zero Hue frame: size={}, intensities={:?}",
-                buf.len(),
-                intensities
-            );
-        }
-
         if let Err(e) = conn.write(&buf, None).await {
-            let _ = pool_tx.send(intensities); // Return buffer
+            let _ = pool_tx.send(universe); // Return buffer
             return Err(anyhow!("Failed to write to DTLS connection: {}", e));
         }
 
-        let _ = pool_tx.send(intensities);
+        let _ = pool_tx.send(universe);
     }
 }
 
 pub fn build_huestream_packet(
-    intensities: &[f32],
-    mappings: &[HueOutputMapping],
+    universe: &[u8; 512],
+    patch: &[HuePatch],
     valid_indices: &[usize],
     sequence: u8,
     area_id: &str,
@@ -490,33 +493,25 @@ pub fn build_huestream_packet(
     }
     buf.extend_from_slice(area_bytes);
 
-    let scale_rgb_channel = |channel: u8, intensity: f32| -> u16 {
-        ((channel as f32 * 257.0) * intensity)
-            .clamp(0.0, 65535.0)
-            .round() as u16
-    };
-    let scale_intensity =
-        |intensity: f32| -> u16 { (intensity * 65535.0).clamp(0.0, 65535.0).round() as u16 };
-
     for &idx in valid_indices {
-        let m = &mappings[idx];
-        let intensity = intensities.get(idx).cloned().unwrap_or(0.0);
+        let p = &patch[idx];
 
-        let (r, g, b) = if let Some([rc, gc, bc]) = m.color {
-            (
-                scale_rgb_channel(rc, intensity),
-                scale_rgb_channel(gc, intensity),
-                scale_rgb_channel(bc, intensity),
-            )
-        } else {
-            let val = scale_intensity(intensity);
-            (val, val, val)
-        };
+        // Account for 1-indexing in config
+        let base_idx = p.dmx_address as usize - 1;
 
-        buf.push(m.channel_id);
-        buf.write_u16::<BigEndian>(r)?;
-        buf.write_u16::<BigEndian>(g)?;
-        buf.write_u16::<BigEndian>(b)?;
+        let r_8 = universe[base_idx];
+        let g_8 = universe[base_idx + 1];
+        let b_8 = universe[base_idx + 2];
+
+        // Translate 8-bit to 16-bit
+        let r_16 = ((r_8 as u16) << 8) | (r_8 as u16);
+        let g_16 = ((g_8 as u16) << 8) | (g_8 as u16);
+        let b_16 = ((b_8 as u16) << 8) | (b_8 as u16);
+
+        buf.push(p.hue_id);
+        buf.write_u16::<BigEndian>(r_16)?;
+        buf.write_u16::<BigEndian>(g_16)?;
+        buf.write_u16::<BigEndian>(b_16)?;
     }
 
     Ok(buf)
@@ -528,35 +523,50 @@ mod tests {
 
     #[test]
     fn test_huestream_packet_layout_v2() {
-        let mappings = vec![
-            HueOutputMapping {
-                internal_id: 1,
-                channel_id: 0,
-                color: Some([255, 128, 0]),
+        let patch = vec![
+            HuePatch {
+                hue_id: 0,
+                dmx_address: 1, // Channels 1, 2, 3 (indices 0, 1, 2)
             },
-            HueOutputMapping {
-                internal_id: 2,
-                channel_id: 1,
-                color: None,
+            HuePatch {
+                hue_id: 1,
+                dmx_address: 11, // Channels 11, 12, 13 (indices 10, 11, 12)
             },
         ];
 
-        let intensities = vec![1.0, 0.5];
+        let mut universe = [0u8; 512];
+        universe[0] = 0xFF; // R1
+        universe[1] = 0x80; // G1
+        universe[2] = 0x00; // B1
+
+        universe[10] = 0x01; // R2
+        universe[11] = 0x00; // G2
+        universe[12] = 0x00; // B2
+
         let sequence = 42;
         let area_id = "12345678-1234-1234-1234-123456789012";
 
-        let packet =
-            build_huestream_packet(&intensities, &mappings, &[0, 1], sequence, area_id).unwrap();
+        let packet = build_huestream_packet(&universe, &patch, &[0, 1], sequence, area_id).unwrap();
 
         assert_eq!(&packet[0..9], b"HueStream");
         assert_eq!(packet[9], 0x02);
         assert_eq!(packet[11], sequence);
         assert_eq!(&packet[16..52], area_id.as_bytes());
+
+        // Light 1 (hue_id 0)
         assert_eq!(packet[52], 0x00);
+        // R1: 0xFFFF
         assert_eq!(packet[53], 0xFF);
         assert_eq!(packet[54], 0xFF);
+        // G1: 0x8080
+        assert_eq!(packet[55], 0x80);
+        assert_eq!(packet[56], 0x80);
+
+        // Light 2 (hue_id 1)
         assert_eq!(packet[59], 0x01);
-        assert_eq!(packet[60], 0x80);
+        // R2: 0x0101
+        assert_eq!(packet[60], 0x01);
+        assert_eq!(packet[61], 0x01);
     }
 }
 

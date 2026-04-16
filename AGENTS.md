@@ -22,13 +22,13 @@ lighting bridge.
 
 - **Tech Stack:** Rust (2021 Edition), `crossbeam-channel`, `tokio` (for
   background I/O only), `just` (task runner), `cross` (for ARM64 compilation).
-- **File Structure:**
-  - `src/` – CLI wiring, TUI rendering (`ratatui`), and initialization.
-  - `crates/pulseplex-core/` – 100% protocol-agnostic math, 3-Tier config, and
-    the 40Hz `PulsePlexEngine`.
-  - `crates/pulseplex-midi/` – Hardware MIDI parsing.
-  - `crates/pulseplex-hue/` – Philips Hue DTLS streaming (background thread
-    isolated).
+- **Architecture:**
+  - `pulseplex-core`: Protocol-agnostic engine with HTP merging and a global
+    512-byte DMX universe buffer.
+  - `pulseplex-midi`: Hardware MIDI parsing.
+  - `pulseplex-hue`: DMX-to-Hue bridge (background thread isolated).
+- **Configuration:** Multi-tier model (MIDI -> Behavior -> Fixture Capability ->
+  Output Patch).
 
 ## Tools You Can Use
 
@@ -46,12 +46,18 @@ Follow these rules for all code you write:
 - **Branching:** Use feature branches (`feat/hue-sink`, `fix/dmx-bounds`).
 - **Commits:** Strictly use **Conventional Commits** (`feat:`, `fix:`,
   `refactor:`, `chore:`, `docs:`).
-- **Example:** `feat(hue): implement background dtls handshake thread`
+- **Example:** `feat(hue): implement DMX translation bridge`
 
 **2. Coding Style & Hot Loop Constraints:**
 
-- **No Allocations:** Never use `Vec::new()` or `String::new()` inside
-  `PulsePlexEngine::process_tick`.
+- **No Allocations or Disk I/O:** Never use `Vec::new()`, `String::new()`, or
+  logging macros (`info!`, `warn!`, `error!`, `debug!`) inside
+  `PulsePlexEngine::process_tick` or any background streaming loops
+  (`stream_to_hue`).
+- **Validation Philosophy:** Validate everything at startup during
+  `PulsePlexConfig::compile()` or constructor `new()` methods. If something is
+  invalid, drop it or `bail!` immediately. Do not defer validation to the hot
+  loop.
 - **Zero-Cost APIs:** Use the Reused Buffer Pattern (`&mut Vec<T>`) for traits
   polled in the hot loop.
 - **Error Handling:** Use `anyhow::Result`. Never use `unwrap()` or `expect()`
@@ -76,6 +82,16 @@ pub fn process_tick(rx: &Receiver<Signal>) {
 }
 ```
 
+**3. Domain-Specific Data Boundaries:**
+
+- **DMX Addressing:** DMX addresses are always 1-indexed (1 to 512) for users,
+  but 0-indexed in arrays. You MUST explicitly validate that any user-provided
+  `start_address` or `dmx_address` is `>= 1` and `<= 512` BEFORE performing
+  subtraction (`address - 1`) to prevent subtraction underflows and panics.
+- **Fixture Footprints:** Always validate that
+  `start_address + footprint - 1 <= 512` during configuration compilation. Never
+  allow out-of-bounds writes to the 512-byte universe array.
+
 ## Troubleshooting & Anti-Loop Protocol
 
 If an error persists after 2 repair attempts, you MUST STOP writing code and
@@ -95,9 +111,8 @@ execute the following protocol:
 
 ## Boundaries
 
-- ✅ **Always:** Run `just all` before creating a commit. Write black-box
-  integration tests using `MockSource` and `MockSink` for any core logic
-  changes.
+- ✅ **Always:** Run `just all` before creating a commit. Write unit tests for
+  core logic changes using `MockSink` to verify the global universe state.
 - ⚠️ **Ask First:** Adding dependencies that require C-bindings (like OpenSSL or
   ALSA). These require explicit updates to `Dockerfile.cross` for our `aarch64`
   deployment targets.

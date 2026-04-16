@@ -30,14 +30,72 @@ decay_seconds = 3.0
 velocity_curve = "hard"
 decay_profile = "exponential"
 
+[[fixtures]]
+id = "hue_snare"
+profile_path = "assets/fixtures/hue-color.json"
+mode = "3-channel"
+start_address = 1
+
+[[fixtures]]
+id = "hue_kick"
+profile_path = "assets/fixtures/hue-color.json"
+mode = "3-channel"
+start_address = 4
+
+[[fixtures]]
+id = "hue_hihat"
+profile_path = "assets/fixtures/hue-color.json"
+mode = "3-channel"
+start_address = 7
+
+[[fixtures]]
+id = "hue_crash"
+profile_path = "assets/fixtures/hue-color.json"
+mode = "3-channel"
+start_address = 10
+
+[[fixture_mappings]]
+behavior_id = "snare"
+fixture_id = "hue_snare"
+capability = "red"
+
+[[fixture_mappings]]
+behavior_id = "snare"
+fixture_id = "hue_snare"
+capability = "green"
+
+[[fixture_mappings]]
+behavior_id = "kick"
+fixture_id = "hue_kick"
+capability = "red"
+
+[[fixture_mappings]]
+behavior_id = "hihat_closed"
+fixture_id = "hue_hihat"
+capability = "red"
+
+[[fixture_mappings]]
+behavior_id = "hihat_closed"
+fixture_id = "hue_hihat"
+capability = "blue"
+
+[[fixture_mappings]]
+behavior_id = "crash_cymbal"
+fixture_id = "hue_crash"
+capability = "red"
+
+[[fixture_mappings]]
+behavior_id = "crash_cymbal"
+fixture_id = "hue_crash"
+capability = "green"
+
+[[fixture_mappings]]
+behavior_id = "crash_cymbal"
+fixture_id = "hue_crash"
+capability = "blue"
+
 [output]
 dmx = []
-hue = [
-  { id = "snare", channel_id = 0, color = [255, 196, 0] },
-  { id = "kick", channel_id = 1, color = [220, 9, 47] },
-  { id = "hihat_closed", channel_id = 2, color = [185, 112, 227] },
-  { id = "crash_cymbal", channel_id = 3, color = [255, 255, 255] },
-]
 
 [[targets]]
 type = "hue"
@@ -46,6 +104,12 @@ bridge_id = "{bridge_id}"
 username = "{username}"
 client_key = "{client_key}"
 area_id = "{area_id}"
+patch = [
+  { hue_id = 0, dmx_address = 1 },
+  { hue_id = 1, dmx_address = 4 },
+  { hue_id = 2, dmx_address = 7 },
+  { hue_id = 3, dmx_address = 10 }
+]
 
 # Uncomment to enable Art-Net output after adding explicit [output].dmx mappings.
 # [[targets]]
