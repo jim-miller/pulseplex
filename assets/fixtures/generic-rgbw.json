@@ -1,0 +1,46 @@
+{
+  "name": "Generic RGBW Par",
+  "manufacturer": "Generic",
+  "channels": [
+    {
+      "offset": 0,
+      "capabilities": [
+        {
+          "cap_type": "Red",
+          "min_dmx": 0,
+          "max_dmx": 255
+        }
+      ]
+    },
+    {
+      "offset": 1,
+      "capabilities": [
+        {
+          "cap_type": "Green",
+          "min_dmx": 0,
+          "max_dmx": 255
+        }
+      ]
+    },
+    {
+      "offset": 2,
+      "capabilities": [
+        {
+          "cap_type": "Blue",
+          "min_dmx": 0,
+          "max_dmx": 255
+        }
+      ]
+    },
+    {
+      "offset": 3,
+      "capabilities": [
+        {
+          "cap_type": "White",
+          "min_dmx": 0,
+          "max_dmx": 255
+        }
+      ]
+    }
+  ]
+}

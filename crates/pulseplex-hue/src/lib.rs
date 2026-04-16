@@ -190,6 +190,12 @@ impl HueSink {
 }
 
 impl LightSink for HueSink {
+    fn send_universe(&mut self, _universe: &[u8; 512]) -> anyhow::Result<()> {
+        // Hue does not currently support raw DMX universes.
+        // For Phase 1, we can leave this as a no-op or implement mapping if needed.
+        Ok(())
+    }
+
     fn send_state(&mut self, intensities: &HashMap<usize, DecayEnvelope>) -> anyhow::Result<()> {
         // 1. Try to get a buffer from the pool (zero allocation)
         let mut buffer = self

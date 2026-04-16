@@ -3,9 +3,26 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use anyhow::{bail, Result};
-use pulseplex_core::BehaviorConfig;
+use pulseplex_core::{
+    fixture::{FixtureInstance, FixtureProfile},
+    BehaviorConfig,
+};
 use serde::Deserialize;
 use toml_edit::{value, DocumentMut};
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct FixtureDefinition {
+    pub id: String,
+    pub profile_path: String,
+    pub start_address: u16,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct FixtureMappingDefinition {
+    pub behavior_id: String,
+    pub fixture_id: String,
+    pub capability: pulseplex_core::fixture::CapabilityType,
+}
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct PulsePlexConfig {
@@ -15,6 +32,10 @@ pub struct PulsePlexConfig {
     #[serde(default)]
     pub targets: Vec<TargetConfig>,
     pub shutdown: ShutdownConfig,
+    #[serde(default)]
+    pub fixtures: Vec<FixtureDefinition>,
+    #[serde(default)]
+    pub fixture_mappings: Vec<FixtureMappingDefinition>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
@@ -102,6 +123,8 @@ pub struct CompiledConfig {
     pub dmx_outputs: Vec<DmxOutputCompiled>,
     pub hue_outputs: Vec<HueOutputCompiled>,
     pub targets: Vec<TargetConfig>,
+    pub fixtures: Vec<FixtureInstance>,
+    pub fixture_mappings: HashMap<usize, Vec<(usize, pulseplex_core::fixture::CapabilityType)>>,
 }
 
 #[derive(Clone)]
@@ -189,6 +212,46 @@ impl PulsePlexConfig {
             }
         }
 
+        let mut fixtures = Vec::new();
+        let mut fixture_id_to_index = HashMap::new();
+        for (idx, f_def) in self.fixtures.iter().enumerate() {
+            let profile_content = fs::read_to_string(&f_def.profile_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to read fixture profile at {}: {}",
+                    f_def.profile_path,
+                    e
+                )
+            })?;
+            let profile: FixtureProfile = serde_json::from_str(&profile_content).map_err(|e| {
+                anyhow::anyhow!("Malformed fixture JSON at {}: {}", f_def.profile_path, e)
+            })?;
+
+            fixtures.push(FixtureInstance::new(
+                f_def.id.clone(),
+                profile,
+                f_def.start_address,
+            ));
+            fixture_id_to_index.insert(f_def.id.clone(), idx);
+        }
+
+        let mut fixture_mappings: HashMap<
+            usize,
+            Vec<(usize, pulseplex_core::fixture::CapabilityType)>,
+        > = HashMap::new();
+        for m in &self.fixture_mappings {
+            let b_internal_id = id_to_internal.get(&m.behavior_id).ok_or_else(|| {
+                anyhow::anyhow!("Fixture mapping behavior_id '{}' not found", m.behavior_id)
+            })?;
+            let f_idx = fixture_id_to_index.get(&m.fixture_id).ok_or_else(|| {
+                anyhow::anyhow!("Fixture mapping fixture_id '{}' not found", m.fixture_id)
+            })?;
+
+            fixture_mappings
+                .entry(*b_internal_id)
+                .or_default()
+                .push((*f_idx, m.capability));
+        }
+
         Ok(CompiledConfig {
             midi_device: self.midi.device_name.clone(),
             midi_id_map,
@@ -196,6 +259,8 @@ impl PulsePlexConfig {
             dmx_outputs,
             hue_outputs,
             targets,
+            fixtures,
+            fixture_mappings,
         })
     }
 }

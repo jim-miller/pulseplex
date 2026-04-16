@@ -173,14 +173,13 @@ pub struct ArtNetSink {
     socket: UdpSocket,
     addr: SocketAddr,
     bridge: ArtNetBridge,
-    builder: DmxFrameBuilder,
 }
 
 impl ArtNetSink {
     pub fn new(
         universe: u16,
         target_ip: &str,
-        mappings: Vec<DmxOutputCompiled>,
+        _mappings: Vec<DmxOutputCompiled>,
     ) -> anyhow::Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_broadcast(true)?;
@@ -193,17 +192,19 @@ impl ArtNetSink {
             socket,
             addr,
             bridge: ArtNetBridge::new(universe),
-            builder: DmxFrameBuilder::new(mappings),
         })
     }
 }
 
 impl LightSink for ArtNetSink {
-    fn send_state(&mut self, intensities: &HashMap<usize, DecayEnvelope>) -> anyhow::Result<()> {
-        let frame = self.builder.build_frame(intensities);
-        self.bridge.set_raw_data(&frame);
+    fn send_universe(&mut self, universe: &[u8; 512]) -> anyhow::Result<()> {
+        self.bridge.set_raw_data(universe);
         self.socket.send_to(self.bridge.as_bytes(), self.addr)?;
         self.bridge.increment_sequence();
+        Ok(())
+    }
+
+    fn send_state(&mut self, _intensities: &HashMap<usize, DecayEnvelope>) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -229,6 +230,31 @@ impl BroadcastSink {
 }
 
 impl LightSink for BroadcastSink {
+    fn send_universe(&mut self, universe: &[u8; 512]) -> anyhow::Result<()> {
+        let mut sent_to_any = false;
+        let mut first_err: Option<anyhow::Error> = None;
+
+        for (idx, sink) in self.sinks.iter_mut().enumerate() {
+            match sink.send_universe(universe) {
+                Ok(()) => {
+                    sent_to_any = true;
+                }
+                Err(err) => {
+                    warn!("Broadcast sink {} send_universe failed: {err:#}", idx);
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
+        }
+
+        if sent_to_any || self.sinks.is_empty() {
+            Ok(())
+        } else {
+            Err(first_err.unwrap_or_else(|| anyhow::anyhow!("All broadcast sinks failed")))
+        }
+    }
+
     fn send_state(&mut self, intensities: &HashMap<usize, DecayEnvelope>) -> anyhow::Result<()> {
         let mut sent_to_any = false;
         let mut first_err: Option<anyhow::Error> = None;
@@ -602,7 +628,11 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
 
     let mut midi_source = setup_midi(&compiled.midi_device, compiled.midi_id_map.clone())?;
 
-    let mut engine = PulsePlexEngine::new(compiled.behaviors.clone());
+    let mut engine = PulsePlexEngine::new(
+        compiled.behaviors.clone(),
+        compiled.fixtures.clone(),
+        compiled.fixture_mappings.clone(),
+    );
 
     let sleeper = SpinSleeper::default();
 
@@ -751,8 +781,11 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                                     }
 
                                     midi_source = new_midi_source;
-                                    engine =
-                                        PulsePlexEngine::new(applied_compiled.behaviors.clone());
+                                    engine = PulsePlexEngine::new(
+                                        applied_compiled.behaviors.clone(),
+                                        applied_compiled.fixtures.clone(),
+                                        applied_compiled.fixture_mappings.clone(),
+                                    );
                                     config = new_config;
                                     compiled = applied_compiled;
                                     info!("Reload successful.");
@@ -1082,6 +1115,10 @@ mod tests {
     }
 
     impl LightSink for SharedMockSink {
+        fn send_universe(&mut self, universe: &[u8; 512]) -> anyhow::Result<()> {
+            self.inner.lock().unwrap().send_universe(universe)
+        }
+
         fn send_state(
             &mut self,
             intensities: &HashMap<usize, DecayEnvelope>,
@@ -1101,6 +1138,12 @@ mod tests {
     }
 
     impl LightSink for FailingSink {
+        fn send_universe(&mut self, _universe: &[u8; 512]) -> anyhow::Result<()> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            Err(anyhow::anyhow!("intentional sink failure"))
+        }
+
         fn send_state(
             &mut self,
             _intensities: &HashMap<usize, DecayEnvelope>,
@@ -1238,6 +1281,8 @@ mod tests {
             dmx_outputs,
             hue_outputs: vec![],
             targets: vec![],
+            fixtures: vec![],
+            fixture_mappings: HashMap::new(),
         };
 
         let mut sink = MockSink::default();
@@ -1287,6 +1332,8 @@ mod tests {
             dmx_outputs,
             hue_outputs: vec![],
             targets: vec![],
+            fixtures: vec![],
+            fixture_mappings: HashMap::new(),
         };
 
         let mut sink = MockSink::default();
