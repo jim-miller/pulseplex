@@ -1,0 +1,26 @@
+{
+  "name": "Hue Color Fixture",
+  "availableChannels": {
+    "Red": {
+      "capabilities": [
+        { "dmxRange": [0, 255], "type": "ColorIntensity", "color": "Red" }
+      ]
+    },
+    "Green": {
+      "capabilities": [
+        { "dmxRange": [0, 255], "type": "ColorIntensity", "color": "Green" }
+      ]
+    },
+    "Blue": {
+      "capabilities": [
+        { "dmxRange": [0, 255], "type": "ColorIntensity", "color": "Blue" }
+      ]
+    }
+  },
+  "modes": [
+    {
+      "name": "3-channel",
+      "channels": ["Red", "Green", "Blue"]
+    }
+  ]
+}

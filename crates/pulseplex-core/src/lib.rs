@@ -455,19 +455,28 @@ mod tests {
         );
 
         // Setup a fixture: 1 channel, Red capability at offset 0, start address 1.
-        let profile = fixture::FixtureProfile {
-            name: "TestFixture".to_string(),
-            manufacturer: "Test".to_string(),
-            channels: vec![fixture::ChannelDef {
-                offset: 0,
-                capabilities: vec![fixture::Capability {
-                    cap_type: fixture::CapabilityType::Red,
-                    min_dmx: 0,
-                    max_dmx: 255,
+        let mut available_channels = HashMap::new();
+        available_channels.insert(
+            "Red".to_string(),
+            fixture::OflChannel {
+                capabilities: vec![fixture::OflCapability {
+                    cap_type: "ColorIntensity".to_string(),
+                    dmx_range: [0, 255],
+                    color: Some("Red".to_string()),
                 }],
+            },
+        );
+
+        let profile = fixture::OflFixture {
+            name: "TestFixture".to_string(),
+            available_channels,
+            modes: vec![fixture::OflMode {
+                name: "3-channel".to_string(),
+                channels: vec!["Red".to_string()],
             }],
         };
-        let fixture = fixture::FixtureInstance::new("f1".to_string(), profile, 1);
+        let fixture =
+            fixture::FixtureInstance::from_ofl("f1".to_string(), &profile, "3-channel", 1).unwrap();
 
         let mut capability_mappings = HashMap::new();
         // behavior 1 -> fixture 0, Red
@@ -540,19 +549,28 @@ mod tests {
             },
         );
 
-        let profile = fixture::FixtureProfile {
-            name: "TestFixture".to_string(),
-            manufacturer: "Test".to_string(),
-            channels: vec![fixture::ChannelDef {
-                offset: 0,
-                capabilities: vec![fixture::Capability {
-                    cap_type: fixture::CapabilityType::Intensity,
-                    min_dmx: 0,
-                    max_dmx: 255,
+        let mut available_channels = HashMap::new();
+        available_channels.insert(
+            "Intensity".to_string(),
+            fixture::OflChannel {
+                capabilities: vec![fixture::OflCapability {
+                    cap_type: "Intensity".to_string(),
+                    dmx_range: [0, 255],
+                    color: None,
                 }],
+            },
+        );
+
+        let profile = fixture::OflFixture {
+            name: "TestFixture".to_string(),
+            available_channels,
+            modes: vec![fixture::OflMode {
+                name: "3-channel".to_string(),
+                channels: vec!["Intensity".to_string()],
             }],
         };
-        let fixture = fixture::FixtureInstance::new("f1".to_string(), profile, 1);
+        let fixture =
+            fixture::FixtureInstance::from_ofl("f1".to_string(), &profile, "3-channel", 1).unwrap();
 
         let mut capability_mappings = HashMap::new();
         capability_mappings.insert(36, vec![(0, fixture::CapabilityType::Intensity)]);

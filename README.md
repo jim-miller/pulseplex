@@ -14,25 +14,21 @@ lighting stays perfectly in pocket with a live musical performance.
 PulsePlex is organized as a Cargo Workspace utilizing a strict Producer-Consumer
 model:
 
-- **`pulseplex-core`**: The mathematical and state-management engine. It is 100%
-  protocol-agnostic and manages the 40Hz orchestration loop, 3-Tier
-  configuration, and Decay Envelopes.
+- **`pulseplex-core`**: The protocol-agnostic math and state engine. Manages the 40Hz orchestration loop and HTP (Highest Takes Precedence) merging into a global 512-byte DMX universe.
 - **`pulseplex-midi`**: Handles high-priority MIDI input, parsing hardware
   triggers into internal Logical IDs.
-- **`pulseplex-hue`**: Streams 16-bit RGB state to Philips Hue bridges via the
-  Entertainment API (UDP/DTLS) using an isolated background thread.
+- **`pulseplex-hue`**: Translates the global 512-byte DMX buffer into 16-bit RGB state for Philips Hue bridges via the Entertainment API (UDP/DTLS) in an isolated background thread.
 
-### The 3-Tier Configuration
+### The Multi-Tier Configuration
 
-PulsePlex decouples inputs from outputs using Logical IDs, allowing you to swap
-instruments or lighting rigs without rewriting your entire configuration:
+PulsePlex decouples inputs from outputs using a flexible multi-tier model, allowing you to swap instruments or lighting rigs without rewriting your entire configuration:
 
-1. **Input Map:** Maps hardware (e.g., MIDI Note 36) to an Internal ID (e.g.,
-   `1`).
-2. **Behavior Map:** Defines the math (e.g., ID `1` uses a 0.5s Exponential
-   Decay).
-3. **Output Map:** Routes the computed intensity of ID `1` to specific hardware
-   (e.g., Art-Net Channel 12, or Hue Light 5).
+1.  **Input Map**: Maps hardware (e.g., MIDI Note 36) to an Internal ID (e.g., `snare`).
+2.  **Behavior Map**: Defines the math (e.g., `snare` uses a 0.5s Linear Decay).
+3.  **Fixture Library**: Instantiates `FixtureProfiles` (JSON) into the virtual DMX universe.
+4.  **Mappings & Patching**:
+    - **Fixture Mappings**: Routes behavior intensity to specific fixture capabilities (e.g., `snare` -> `Red` on `Fixture 1`).
+    - **Target Patch**: Maps the global DMX buffer to specific hardware IDs (e.g., Hue Entertainment ID 0 -> DMX address 1).
 
 ## Getting Started
 

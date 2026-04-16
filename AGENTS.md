@@ -22,13 +22,11 @@ lighting bridge.
 
 - **Tech Stack:** Rust (2021 Edition), `crossbeam-channel`, `tokio` (for
   background I/O only), `just` (task runner), `cross` (for ARM64 compilation).
-- **File Structure:**
-  - `src/` – CLI wiring, TUI rendering (`ratatui`), and initialization.
-  - `crates/pulseplex-core/` – 100% protocol-agnostic math, 3-Tier config, and
-    the 40Hz `PulsePlexEngine`.
-  - `crates/pulseplex-midi/` – Hardware MIDI parsing.
-  - `crates/pulseplex-hue/` – Philips Hue DTLS streaming (background thread
-    isolated).
+- **Architecture:**
+  - `pulseplex-core`: Protocol-agnostic engine with HTP merging and a global 512-byte DMX universe buffer.
+  - `pulseplex-midi`: Hardware MIDI parsing.
+  - `pulseplex-hue`: DMX-to-Hue bridge (background thread isolated).
+- **Configuration:** Multi-tier model (MIDI -> Behavior -> Fixture Capability -> Output Patch).
 
 ## Tools You Can Use
 
@@ -46,7 +44,7 @@ Follow these rules for all code you write:
 - **Branching:** Use feature branches (`feat/hue-sink`, `fix/dmx-bounds`).
 - **Commits:** Strictly use **Conventional Commits** (`feat:`, `fix:`,
   `refactor:`, `chore:`, `docs:`).
-- **Example:** `feat(hue): implement background dtls handshake thread`
+- **Example:** `feat(hue): implement DMX translation bridge`
 
 **2. Coding Style & Hot Loop Constraints:**
 
@@ -95,9 +93,7 @@ execute the following protocol:
 
 ## Boundaries
 
-- ✅ **Always:** Run `just all` before creating a commit. Write black-box
-  integration tests using `MockSource` and `MockSink` for any core logic
-  changes.
+- ✅ **Always:** Run `just all` before creating a commit. Write unit tests for core logic changes using `MockSink` to verify the global universe state.
 - ⚠️ **Ask First:** Adding dependencies that require C-bindings (like OpenSSL or
   ALSA). These require explicit updates to `Dockerfile.cross` for our `aarch64`
   deployment targets.

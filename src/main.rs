@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pulseplex_core::{ArtNetBridge, DecayEnvelope, LightSink, PulsePlexEngine, Signal};
-use pulseplex_hue::{HueOutputMapping, HueSink};
+use pulseplex_hue::HueSink;
 use pulseplex_midi::setup_midi;
 
 use anyhow::{bail, Context};
@@ -538,13 +538,12 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                 info!("Initialized Art-Net sink for universe {}", artnet.universe);
             }
             TargetConfig::Hue(hue) => {
-                let hue_mappings: Vec<HueOutputMapping> = compiled
-                    .hue_outputs
+                let hue_patch: Vec<pulseplex_hue::HuePatch> = hue
+                    .patch
                     .iter()
-                    .map(|h| HueOutputMapping {
-                        internal_id: h.internal_id,
-                        channel_id: h.channel_id,
-                        color: h.color,
+                    .map(|p| pulseplex_hue::HuePatch {
+                        hue_id: p.hue_id,
+                        dmx_address: p.dmx_address,
                     })
                     .collect();
 
@@ -554,7 +553,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                     hue.username.clone(),
                     hue.client_key.clone(),
                     hue.area_id.clone(),
-                    hue_mappings.clone(),
+                    hue_patch.clone(),
                 );
 
                 match sink_res {
@@ -600,7 +599,7 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                                 hue.username.clone(),
                                 hue.client_key.clone(),
                                 hue.area_id.clone(),
-                                hue_mappings,
+                                hue_patch,
                             ) {
                                 Ok(sink) => {
                                     main_sink.add(Box::new(sink));
@@ -747,21 +746,21 @@ fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> anyhow
                                                 }
                                             }
                                             TargetConfig::Hue(hue) => {
-                                                let hue_mappings = applied_compiled
-                                                    .hue_outputs
+                                                let hue_patch = hue
+                                                    .patch
                                                     .iter()
-                                                    .map(|h| HueOutputMapping {
-                                                        internal_id: h.internal_id,
-                                                        channel_id: h.channel_id,
-                                                        color: h.color,
+                                                    .map(|p| pulseplex_hue::HuePatch {
+                                                        hue_id: p.hue_id,
+                                                        dmx_address: p.dmx_address,
                                                     })
                                                     .collect();
+
                                                 match HueSink::new(
                                                     hue.bridge_ip.clone(),
                                                     hue.username.clone(),
                                                     hue.client_key.clone(),
                                                     hue.area_id.clone(),
-                                                    hue_mappings,
+                                                    hue_patch,
                                                 ) {
                                                     Ok(sink) => new_main_sink.add(Box::new(sink)),
                                                     Err(e) => warn!(
@@ -1279,7 +1278,6 @@ mod tests {
             midi_id_map: HashMap::new(),
             behaviors: HashMap::new(),
             dmx_outputs,
-            hue_outputs: vec![],
             targets: vec![],
             fixtures: vec![],
             fixture_mappings: HashMap::new(),
@@ -1330,7 +1328,6 @@ mod tests {
             midi_id_map: HashMap::new(),
             behaviors: HashMap::new(),
             dmx_outputs,
-            hue_outputs: vec![],
             targets: vec![],
             fixtures: vec![],
             fixture_mappings: HashMap::new(),

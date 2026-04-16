@@ -4,7 +4,7 @@ use std::{env, fs};
 
 use anyhow::{bail, Result};
 use pulseplex_core::{
-    fixture::{FixtureInstance, FixtureProfile},
+    fixture::{FixtureInstance, OflFixture},
     BehaviorConfig,
 };
 use serde::Deserialize;
@@ -14,6 +14,7 @@ use toml_edit::{value, DocumentMut};
 pub struct FixtureDefinition {
     pub id: String,
     pub profile_path: String,
+    pub mode: String,
     pub start_address: u16,
 }
 
@@ -58,21 +59,12 @@ pub struct BehaviorDefinition {
 pub struct OutputConfig {
     pub artnet: Option<ArtNetConfig>,
     pub dmx: Vec<DmxOutputDefinition>,
-    #[serde(default)]
-    pub hue: Vec<HueOutputDefinition>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct DmxOutputDefinition {
     pub id: String,
     pub channel: usize,
-    pub color: Option<[u8; 3]>,
-}
-
-#[derive(Deserialize, Debug, Clone, PartialEq)]
-pub struct HueOutputDefinition {
-    pub id: String,
-    pub channel_id: u8,
     pub color: Option<[u8; 3]>,
 }
 
@@ -96,6 +88,14 @@ pub struct HueConfig {
     pub username: String,
     pub client_key: String,
     pub area_id: String,
+    #[serde(default)]
+    pub patch: Vec<HuePatch>,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct HuePatch {
+    pub hue_id: u8,
+    pub dmx_address: u16,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -121,7 +121,6 @@ pub struct CompiledConfig {
     pub midi_id_map: HashMap<u8, usize>,
     pub behaviors: HashMap<usize, BehaviorConfig>,
     pub dmx_outputs: Vec<DmxOutputCompiled>,
-    pub hue_outputs: Vec<HueOutputCompiled>,
     pub targets: Vec<TargetConfig>,
     pub fixtures: Vec<FixtureInstance>,
     pub fixture_mappings: HashMap<usize, Vec<(usize, pulseplex_core::fixture::CapabilityType)>>,
@@ -131,13 +130,6 @@ pub struct CompiledConfig {
 pub struct DmxOutputCompiled {
     pub internal_id: usize,
     pub channel: usize,
-    pub color: Option<[u8; 3]>,
-}
-
-#[derive(Clone)]
-pub struct HueOutputCompiled {
-    pub internal_id: usize,
-    pub channel_id: u8,
     pub color: Option<[u8; 3]>,
 }
 
@@ -191,17 +183,6 @@ impl PulsePlexConfig {
             }
         }
 
-        let mut hue_outputs = Vec::new();
-        for h in &self.output.hue {
-            if let Some(internal_id) = id_to_internal.get(&h.id) {
-                hue_outputs.push(HueOutputCompiled {
-                    internal_id: *internal_id,
-                    channel_id: h.channel_id,
-                    color: h.color,
-                });
-            }
-        }
-
         let mut targets = self.targets.clone();
         if let Some(artnet) = &self.output.artnet {
             let has_equivalent_artnet_target = targets.iter().any(
@@ -222,15 +203,19 @@ impl PulsePlexConfig {
                     e
                 )
             })?;
-            let profile: FixtureProfile = serde_json::from_str(&profile_content).map_err(|e| {
+            let profile: OflFixture = serde_json::from_str(&profile_content).map_err(|e| {
                 anyhow::anyhow!("Malformed fixture JSON at {}: {}", f_def.profile_path, e)
             })?;
 
-            fixtures.push(FixtureInstance::new(
+            let instance = FixtureInstance::from_ofl(
                 f_def.id.clone(),
-                profile,
+                &profile,
+                &f_def.mode,
                 f_def.start_address,
-            ));
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to instantiate fixture '{}': {}", f_def.id, e))?;
+
+            fixtures.push(instance);
             fixture_id_to_index.insert(f_def.id.clone(), idx);
         }
 
@@ -257,7 +242,6 @@ impl PulsePlexConfig {
             midi_id_map,
             behaviors,
             dmx_outputs,
-            hue_outputs,
             targets,
             fixtures,
             fixture_mappings,
