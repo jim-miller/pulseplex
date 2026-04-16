@@ -933,82 +933,31 @@ fn perform_shutdown(
     config: &crate::config::ShutdownConfig,
     sink: &mut dyn LightSink,
     initial_state: &[u8; 512],
-    compiled: &crate::config::CompiledConfig,
+    _compiled: &crate::config::CompiledConfig,
 ) -> anyhow::Result<()> {
-    let mut shutdown_intensities = HashMap::new();
-
     match config.mode {
         ShutdownMode::Blackout => {
             info!("Shutting down: Blackout");
-            // intensities is already empty -> blackout
+            sink.send_universe(&[0u8; 512])?;
         }
         ShutdownMode::Default => {
             info!("Shutting down: Applying default scene");
+            let mut frame = [0u8; 512];
             if let Some(defaults) = &config.defaults {
-                for m in &compiled.dmx_outputs {
-                    let mut max_intensity: f32 = 0.0;
-
-                    if let Some(base_color) = m.color {
-                        // For RGB, check all 3 channels and derive max intensity relative to base color
-                        for (offset, &base_val) in base_color.iter().enumerate() {
-                            if base_val > 0 {
-                                if let Some(&default_val) = defaults.get(&(m.channel + offset)) {
-                                    let intensity = default_val as f32 / base_val as f32;
-                                    max_intensity = max_intensity.max(intensity);
-                                }
-                            }
-                        }
-                    } else {
-                        // For grayscale, just check the single channel
-                        if let Some(&default_val) = defaults.get(&m.channel) {
-                            max_intensity = default_val as f32 / 255.0;
-                        }
-                    }
-
-                    if max_intensity > 0.0 {
-                        let mut env = pulseplex_core::DecayEnvelope::new(
-                            1.0,
-                            Default::default(),
-                            Default::default(),
-                        );
-                        env.intensity = max_intensity.min(1.0);
-                        shutdown_intensities.insert(m.internal_id, env);
+                for (&chan, &val) in defaults {
+                    if chan < 512 {
+                        frame[chan] = val;
                     }
                 }
             }
+            sink.send_universe(&frame)?;
         }
         ShutdownMode::Restore => {
             info!("Shutting down: Restoring previous state");
-            for m in &compiled.dmx_outputs {
-                let mut max_intensity: f32 = 0.0;
-
-                if let Some(base_color) = m.color {
-                    for (offset, &base_val) in base_color.iter().enumerate() {
-                        if base_val > 0 {
-                            if let Some(&captured_val) = initial_state.get(m.channel + offset) {
-                                let intensity = captured_val as f32 / base_val as f32;
-                                max_intensity = max_intensity.max(intensity);
-                            }
-                        }
-                    }
-                } else if let Some(&captured_val) = initial_state.get(m.channel) {
-                    max_intensity = captured_val as f32 / 255.0;
-                }
-
-                if max_intensity > 0.0 {
-                    let mut env = pulseplex_core::DecayEnvelope::new(
-                        1.0,
-                        Default::default(),
-                        Default::default(),
-                    );
-                    env.intensity = max_intensity.min(1.0);
-                    shutdown_intensities.insert(m.internal_id, env);
-                }
-            }
+            sink.send_universe(initial_state)?;
         }
     }
 
-    sink.send_state(&shutdown_intensities)?;
     Ok(())
 }
 
@@ -1291,10 +1240,10 @@ mod tests {
         perform_shutdown(&config, &mut sink, &initial_state, &compiled).unwrap();
 
         assert_eq!(sink.states.len(), 1);
-        // Channel 0 maps to ID 100
-        assert!((*sink.states[0].get(&100).unwrap() - 1.0).abs() < 0.01);
-        // Channel 10 maps to ID 101
-        assert!((*sink.states[0].get(&101).unwrap() - 0.5).abs() < 0.01);
+        // Channel 0 has 255
+        assert!((*sink.states[0].get(&0).unwrap() - 255.0).abs() < 0.01);
+        // Channel 10 has 100
+        assert!((*sink.states[0].get(&10).unwrap() - 100.0).abs() < 0.01);
     }
 
     #[test]
@@ -1339,9 +1288,9 @@ mod tests {
         perform_shutdown(&config, &mut sink, &initial_state, &compiled).unwrap();
 
         assert_eq!(sink.states.len(), 1);
-        // Channel 5 maps to ID 200
-        assert!((*sink.states[0].get(&200).unwrap() - 1.0).abs() < 0.01);
-        // Channel 11 maps to Green of ID 201
-        assert!((*sink.states[0].get(&201).unwrap() - 0.50).abs() < 0.01);
+        // Channel 5 has 255
+        assert!((*sink.states[0].get(&5).unwrap() - 255.0).abs() < 0.01);
+        // Channel 11 has 128
+        assert!((*sink.states[0].get(&11).unwrap() - 128.0).abs() < 0.01);
     }
 }

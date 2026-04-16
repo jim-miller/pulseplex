@@ -11,7 +11,6 @@ streaming = ["dep:webrtc-dtls"]
 [dependencies]
 pulseplex-core = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 crossbeam-channel = { workspace = true }
 tracing = { workspace = true }
 tokio = { version = "1.43.0", features = ["full"] }

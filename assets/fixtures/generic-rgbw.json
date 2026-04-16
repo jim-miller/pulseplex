@@ -1,46 +1,31 @@
 {
-  "name": "Generic RGBW Par",
-  "manufacturer": "Generic",
-  "channels": [
-    {
-      "offset": 0,
+  "name": "Generic RGBW Fixture",
+  "availableChannels": {
+    "Red": {
       "capabilities": [
-        {
-          "cap_type": "Red",
-          "min_dmx": 0,
-          "max_dmx": 255
-        }
+        { "dmxRange": [0, 255], "type": "ColorIntensity", "color": "Red" }
       ]
     },
-    {
-      "offset": 1,
+    "Green": {
       "capabilities": [
-        {
-          "cap_type": "Green",
-          "min_dmx": 0,
-          "max_dmx": 255
-        }
+        { "dmxRange": [0, 255], "type": "ColorIntensity", "color": "Green" }
       ]
     },
-    {
-      "offset": 2,
+    "Blue": {
       "capabilities": [
-        {
-          "cap_type": "Blue",
-          "min_dmx": 0,
-          "max_dmx": 255
-        }
+        { "dmxRange": [0, 255], "type": "ColorIntensity", "color": "Blue" }
       ]
     },
-    {
-      "offset": 3,
+    "White": {
       "capabilities": [
-        {
-          "cap_type": "White",
-          "min_dmx": 0,
-          "max_dmx": 255
-        }
+        { "dmxRange": [0, 255], "type": "ColorIntensity", "color": "White" }
       ]
+    }
+  },
+  "modes": [
+    {
+      "name": "4-channel",
+      "channels": ["Red", "Green", "Blue", "White"]
     }
   ]
 }

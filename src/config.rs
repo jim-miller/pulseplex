@@ -37,6 +37,8 @@ pub struct PulsePlexConfig {
     pub fixtures: Vec<FixtureDefinition>,
     #[serde(default)]
     pub fixture_mappings: Vec<FixtureMappingDefinition>,
+    #[serde(skip)]
+    pub base_dir: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
@@ -136,7 +138,8 @@ pub struct DmxOutputCompiled {
 impl PulsePlexConfig {
     pub fn load(path: &str) -> Result<Self> {
         let content = fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&content)?;
+        let mut config: Self = toml::from_str(&content)?;
+        config.base_dir = Path::new(path).parent().map(|p| p.to_path_buf());
         Ok(config)
     }
 
@@ -196,16 +199,45 @@ impl PulsePlexConfig {
         let mut fixtures = Vec::new();
         let mut fixture_id_to_index = HashMap::new();
         for (idx, f_def) in self.fixtures.iter().enumerate() {
-            let profile_content = fs::read_to_string(&f_def.profile_path).map_err(|e| {
+            if f_def.start_address < 1 {
+                bail!("Fixture {} start_address must be >= 1", f_def.id);
+            }
+
+            let mut profile_path = PathBuf::from(&f_def.profile_path);
+            if profile_path.is_relative() {
+                if let Some(base) = &self.base_dir {
+                    profile_path = base.join(profile_path);
+                }
+            }
+
+            let profile_content = fs::read_to_string(&profile_path).map_err(|e| {
                 anyhow::anyhow!(
-                    "Failed to read fixture profile at {}: {}",
-                    f_def.profile_path,
+                    "Failed to read fixture profile at {:?}: {}",
+                    profile_path,
                     e
                 )
             })?;
             let profile: OflFixture = serde_json::from_str(&profile_content).map_err(|e| {
-                anyhow::anyhow!("Malformed fixture JSON at {}: {}", f_def.profile_path, e)
+                anyhow::anyhow!("Malformed fixture JSON at {:?}: {}", profile_path, e)
             })?;
+
+            // Footprint validation
+            let footprint = profile
+                .modes
+                .iter()
+                .find(|m| m.name == f_def.mode)
+                .map(|m| m.channels.len())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Mode '{}' not found in profile for {}",
+                        f_def.mode,
+                        f_def.id
+                    )
+                })?;
+
+            if f_def.start_address as usize + footprint - 1 > 512 {
+                bail!("Fixture {} exceeds 512 channel universe", f_def.id);
+            }
 
             let instance = FixtureInstance::from_ofl(
                 f_def.id.clone(),
@@ -216,7 +248,9 @@ impl PulsePlexConfig {
             .map_err(|e| anyhow::anyhow!("Failed to instantiate fixture '{}': {}", f_def.id, e))?;
 
             fixtures.push(instance);
-            fixture_id_to_index.insert(f_def.id.clone(), idx);
+            if fixture_id_to_index.insert(f_def.id.clone(), idx).is_some() {
+                bail!("Duplicate fixture id '{}'", f_def.id);
+            }
         }
 
         let mut fixture_mappings: HashMap<

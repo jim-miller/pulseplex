@@ -136,6 +136,22 @@ impl HueSink {
             return Err(anyhow!("Hue area_id must be exactly 36 characters (UUID)"));
         }
 
+        // Filter valid patches
+        let filtered_patch: Vec<HuePatch> = patch
+            .into_iter()
+            .filter(|p| {
+                if p.dmx_address < 1 || p.dmx_address + 2 > 512 {
+                    warn!(
+                        "Dropped invalid Hue patch: dmx_address {} is out of bounds (1-512)",
+                        p.dmx_address
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+
         // Forward channel: Hot loop -> Background thread
         let (tx, rx) = channel(1);
 
@@ -147,7 +163,7 @@ impl HueSink {
             pool_tx.send([0u8; 512]).unwrap();
         }
 
-        let background_patch = patch.clone();
+        let background_patch = filtered_patch.clone();
         let pool_tx_clone = pool_tx.clone();
 
         // Construct runtime before spawning to surface errors
@@ -183,7 +199,7 @@ impl HueSink {
             tx,
             pool_tx,
             pool_rx,
-            patch,
+            patch: filtered_patch,
         })
     }
 }
@@ -482,14 +498,6 @@ pub fn build_huestream_packet(
 
         // Account for 1-indexing in config
         let base_idx = p.dmx_address as usize - 1;
-
-        if base_idx + 2 >= 512 {
-            warn!(
-                "Hue Patch address {} exceeds universe bounds. Skipping.",
-                p.dmx_address
-            );
-            continue;
-        }
 
         let r_8 = universe[base_idx];
         let g_8 = universe[base_idx + 1];
