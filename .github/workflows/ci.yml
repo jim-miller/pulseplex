@@ -33,6 +33,9 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      # # fmt, clippy -D warnings, and test
+      # fmt check, clippy with warnings denied, and tests with lockfile enforced
       - name: Run CI Gate
-        run: just all
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-features
