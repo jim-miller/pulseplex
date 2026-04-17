@@ -2225,7 +2225,7 @@ dependencies = [
 
 [[package]]
 name = "pulseplex"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2259,7 +2259,7 @@ dependencies = [
 
 [[package]]
 name = "pulseplex-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -2269,7 +2269,7 @@ dependencies = [
 
 [[package]]
 name = "pulseplex-hue"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2289,7 +2289,7 @@ dependencies = [
 
 [[package]]
 name = "pulseplex-midi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",

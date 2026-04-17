@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 authors = ["PulsePlex <contact@pulseplex.net>"]
 edition = "2021"
 
@@ -50,9 +50,9 @@ rustls-pemfile = "2.1"
 rustls-pki_types = { version = "1.10", package = "rustls-pki-types" }
 
 [workspace.dependencies]
-pulseplex-core = { path = "crates/pulseplex-core", version = "=0.1.0" }
-pulseplex-hue = { path = "crates/pulseplex-hue", version = "=0.1.0", default-features = false }
-pulseplex-midi = { path = "crates/pulseplex-midi", version = "=0.1.0" }
+pulseplex-core = { path = "crates/pulseplex-core", version = "=0.1.1" }
+pulseplex-hue = { path = "crates/pulseplex-hue", version = "=0.1.1", default-features = false }
+pulseplex-midi = { path = "crates/pulseplex-midi", version = "=0.1.1" }
 
 anyhow = "1.0"
 crossbeam-channel = "0.5.15"
