@@ -57,3 +57,7 @@ deploy-remote TARGET: build-arm
     scp target/aarch64-unknown-linux-gnu/release/pulseplex {{ TARGET }}:/tmp/pulseplex
     ssh {{ TARGET }} "sudo mv /tmp/pulseplex /usr/local/bin/pulseplex && sudo chmod +x /usr/local/bin/pulseplex"
     @echo "Deployment complete! Ready to run 'pulseplex' on {{ TARGET }}."
+
+ci:
+    cargo fmt --all -- --check
+    cargo clippy --locked --all-targets --all-features -- -D warnings

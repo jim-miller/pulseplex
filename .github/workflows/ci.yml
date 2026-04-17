@@ -18,6 +18,8 @@ jobs:
 
       - name: Install just
         uses: taiki-e/install-action@584bc363de2ed4be09b4ce5946050e12eb754219 # just
+        with:
+          tool: just
 
       - name: Install system dependencies
         run: |
@@ -33,9 +35,6 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      # fmt check, clippy with warnings denied, and tests with lockfile enforced
+      # # fmt, clippy -D warnings, and test
       - name: Run CI Gate
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --locked --all-targets --all-features -- -D warnings
-          cargo test --locked --all-features
+        run: just ci
