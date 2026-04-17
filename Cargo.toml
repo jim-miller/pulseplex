@@ -6,15 +6,18 @@ resolver = "2"
 version = "0.1.1"
 authors = ["PulsePlex <contact@pulseplex.net>"]
 edition = "2021"
+description = "A high-performance, real-time MIDI-to-Art-Net/Hue lighting orchestration engine"
+license = "MIT"
+repository = "https://github.com/jim-miller/pulseplex"
 
 [package]
 name = "pulseplex"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "A high-performance, real-time MIDI-to-Art-Net/Hue lighting orchestration engine"
-license = "MIT"
-repository = "https://github.com/jim-miller/pulseplex"
+license.workspace = true
+description.workspace = true
+repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
