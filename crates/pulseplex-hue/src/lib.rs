@@ -1,12 +1,12 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use byteorder::{BigEndian, WriteBytesExt};
 use crossbeam_channel::{bounded, Receiver, Sender};
-use pulseplex_core::{DecayEnvelope, LightSink};
+use pulseplex_core::LightSink;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::net::UdpSocket;
@@ -204,13 +204,14 @@ impl HueSink {
     }
 }
 
+#[async_trait]
 impl LightSink for HueSink {
-    fn send_universe(&mut self, universe: &[u8; 512]) -> anyhow::Result<()> {
+    async fn write_universe(&mut self, _universe_id: u16, data: &[u8; 512]) -> anyhow::Result<()> {
         // 1. Try to get a buffer from the pool (zero allocation)
         let mut buffer = self.pool_rx.try_recv().unwrap_or([0u8; 512]);
 
         // 2. Fill the buffer
-        buffer.copy_from_slice(universe);
+        buffer.copy_from_slice(data);
 
         // 3. Try send to background thread (non-blocking)
         if let Err(err) = self.tx.try_send(buffer) {
@@ -225,10 +226,6 @@ impl LightSink for HueSink {
             }
         }
 
-        Ok(())
-    }
-
-    fn send_state(&mut self, _intensities: &HashMap<usize, DecayEnvelope>) -> anyhow::Result<()> {
         Ok(())
     }
 }

@@ -58,6 +58,7 @@ pub struct OflMode {
 pub struct FixtureInstance {
     pub id: String,
     pub name: String,
+    pub universe: u16,
     pub start_address: u16,
     /// Maps CapabilityType to 0-indexed DMX offset relative to start_address
     pub capability_offsets: HashMap<CapabilityType, usize>,
@@ -68,6 +69,7 @@ impl FixtureInstance {
         id: String,
         fixture: &OflFixture,
         mode_name: &str,
+        universe: u16,
         start_address: u16,
     ) -> Result<Self, FixtureError> {
         let mode = fixture
@@ -94,17 +96,18 @@ impl FixtureInstance {
         Ok(Self {
             id,
             name: fixture.name.clone(),
+            universe,
             start_address,
             capability_offsets,
         })
     }
 
-    /// Returns the DMX address for a specific capability.
+    /// Returns the absolute DMX address (universe, channel_0_indexed) for a specific capability.
     /// Returns None if the capability is not supported by this fixture.
-    pub fn get_dmx_address(&self, cap_type: CapabilityType) -> Option<usize> {
+    pub fn get_dmx_address(&self, cap_type: CapabilityType) -> Option<(u16, usize)> {
         self.capability_offsets.get(&cap_type).map(|&offset| {
             // start_address is 1-indexed, convert to 0-indexed for buffer access
-            (self.start_address as usize - 1) + offset
+            (self.universe, (self.start_address as usize - 1) + offset)
         })
     }
 }

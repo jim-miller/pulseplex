@@ -1,28 +1,73 @@
 use std::collections::HashMap;
 
-use anyhow::{anyhow, Context, Result};
-use crossbeam_channel::{unbounded, Receiver, TryRecvError};
+use anyhow::{Context, Result};
 use midir::{MidiInput, MidiInputConnection, MidiInputPort};
-use pulseplex_core::{EventSource, Signal};
-use tracing::{debug, info};
+use pulseplex_core::{LightSource, SourceEvent};
+use tracing::info;
 
-pub struct MidiReceiver {
-    rx: Receiver<Signal>,
+pub struct MidiSource {
+    target_device: String,
+    id_map: HashMap<u8, u16>,
     // Hold onto the connection so it doesn't drop and kill the bg thread
-    _conn: MidiInputConnection<()>,
+    _conn: Option<MidiInputConnection<()>>,
 }
 
-impl EventSource for MidiReceiver {
-    fn poll(&mut self, buffer: &mut Vec<Signal>) -> anyhow::Result<()> {
-        loop {
-            match self.rx.try_recv() {
-                Ok(signal) => buffer.push(signal),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    return Err(anyhow!("MIDI background thread disconnected"));
-                }
-            }
+impl MidiSource {
+    pub fn new(target_device: &str, id_map: HashMap<u8, u16>) -> Self {
+        Self {
+            target_device: target_device.to_string(),
+            id_map,
+            _conn: None,
         }
+    }
+}
+
+impl LightSource for MidiSource {
+    fn run(&mut self, sender: crossbeam_channel::Sender<SourceEvent>) -> anyhow::Result<()> {
+        let mut midi_in = MidiInput::new("pulseplex-input")?;
+        midi_in.ignore(midir::Ignore::None);
+
+        let port = find_midi_port(&midi_in, &self.target_device).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Could not find MIDI device containing: '{}'",
+                self.target_device
+            )
+        })?;
+
+        let port_name = midi_in.port_name(&port)?;
+        info!("Binding to MIDI port: {}", port_name);
+
+        let id_map = self.id_map.clone();
+
+        let conn = midi_in
+            .connect(
+                &port,
+                "pulseplex-read",
+                move |_stamp, message, _| {
+                    if message.len() >= 3 {
+                        let status = message[0] & 0xF0;
+                        let note = message[1];
+                        let velocity = message[2];
+
+                        if let Some(&internal_id) = id_map.get(&note) {
+                            match status {
+                                0x90 if velocity > 0 => {
+                                    let _ = sender.send(SourceEvent::Trigger {
+                                        id: internal_id,
+                                        velocity,
+                                    });
+                                }
+                                // We don't currently handle Release or ClearAll from MIDI
+                                _ => {}
+                            }
+                        }
+                    }
+                },
+                (),
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to connect to MIDI port: {}", e))?;
+
+        self._conn = Some(conn);
         Ok(())
     }
 }
@@ -56,56 +101,4 @@ pub fn find_midi_port(midi_in: &midir::MidiInput, target_name: &str) -> Option<M
         }
     }
     None
-}
-
-pub fn setup_midi(target_device: &str, id_map: HashMap<u8, usize>) -> anyhow::Result<MidiReceiver> {
-    let mut midi_in = MidiInput::new("pulseplex-input")?;
-    midi_in.ignore(midir::Ignore::None);
-
-    let (tx, rx) = unbounded();
-
-    let port = find_midi_port(&midi_in, target_device).ok_or_else(|| {
-        anyhow::anyhow!("Could not find MIDI device containing: '{}'", target_device)
-    })?;
-
-    let port_name = midi_in.port_name(&port)?;
-    info!("Binding to MIDI port: {}", port_name);
-
-    let _conn = midi_in
-        .connect(
-            &port,
-            "pulseplex-read",
-            move |_stamp, message, _| {
-                if message.len() >= 3 {
-                    let status = message[0] & 0xF0;
-                    let note = message[1];
-                    let velocity = message[2];
-
-                    debug!(
-                        "MIDI Event: status={:#04x}, note={}, velocity={}",
-                        status, note, velocity
-                    );
-
-                    if let Some(&internal_id) = id_map.get(&note) {
-                        debug!("MIDI Note {} mapped to internal_id={}", note, internal_id);
-                        match status {
-                            0x90 if velocity > 0 => {
-                                let _ = tx.send(Signal::Trigger {
-                                    id: internal_id,
-                                    velocity,
-                                });
-                            }
-                            0x80 | 0x90 => {
-                                let _ = tx.send(Signal::Release { id: internal_id });
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            },
-            (),
-        )
-        .map_err(|e| anyhow!("Failed to connect to MIDI port: {}", e))?;
-
-    Ok(MidiReceiver { rx, _conn })
 }
