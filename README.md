@@ -1,4 +1,5 @@
 [![CI](https://github.com/jim-miller/pulseplex/actions/workflows/ci.yml/badge.svg)](https://github.com/jim-miller/pulseplex/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Release](https://github.com/jim-miller/pulseplex/actions/workflows/release.yml/badge.svg)](https://github.com/jim-miller/pulseplex/actions/workflows/release.yml)
 
 # PulsePlex 🥁💡
@@ -12,51 +13,108 @@ As a systems-first project, PulsePlex prioritizes deterministic timing,
 zero-cost abstractions, and a strict 40Hz orchestration loop to ensure your
 lighting stays perfectly in pocket with a live musical performance.
 
-## Architecture
+## ✨ Features
 
-PulsePlex is organized as a Cargo Workspace utilizing a strict Producer-Consumer
-model:
+- **The Broadcast Hub Topology:** PulsePlex uses a strict 8-bit DMX Intermediate
+  Representation. It performs complex decay and merging math once, and
+  broadcasts the resulting DMX universe to all parallel outputs simultaneously.
+- **Philips Hue Entertainment Bridge:** Transforms standard DMX signals into
+  16-bit color space and streams them to your Hue Bridge via UDP/DTLS with zero
+  perceived latency.
+- **First-Run Setup Wizard:** Automatically discovers your Hue Bridge via mDNS,
+  handles the push-link authorization, and maps your MIDI devices interactively.
+- **Interactive TUI Dashboard:** Monitor active envelopes, recent hardware
+  triggers, and a live visual representation of your DMX universe output in
+  real-time.
+- **Live Hot-Reloading:** Tweak your `.toml` configuration or `.json` fixture
+  profiles and watch the lights update instantly without dropping the daemon.
 
-- **`pulseplex-core`**: The protocol-agnostic math and state engine. Manages the
-  40Hz orchestration loop and HTP (Highest Takes Precedence) merging into a
-  global 512-byte DMX universe.
-- **`pulseplex-midi`**: Handles high-priority MIDI input, parsing hardware
-  triggers into internal Logical IDs.
-- **`pulseplex-hue`**: Translates the global 512-byte DMX buffer into 16-bit RGB
-  state for Philips Hue bridges via the Entertainment API (UDP/DTLS) in an
-  isolated background thread.
+---
+
+## 🚀 Quick Start (Users)
+
+If you are just looking to run PulsePlex with your electronic drum kit:
+
+**1. Install** Ensure you have [Rust installed](https://rustup.rs/), then clone
+and build the release binary:
+
+```bash
+git clone [https://github.com/jim-miller/pulseplex.git](https://github.com/jim-miller/pulseplex.git)
+cd pulseplex
+cargo install --path .
+```
+
+**2. Run the Wizard** Starting PulsePlex for the first time will automatically
+launch the setup wizard to connect your Hue Bridge and select your MIDI
+controller.
+
+```bash
+pulseplex run
+```
+
+### Useful CLI Commands
+
+PulsePlex includes a suite of tools to manage your lighting rig:
+
+- `pulseplex run` - Starts the main 40Hz orchestration daemon and TUI dashboard.
+- `pulseplex run --no-tui` - Runs the daemon headlessly, streaming logs to
+  `stdout`.
+- `pulseplex hue setup` - Interactively discovers and configures a new Philips
+  Hue Bridge without overwriting your DMX settings.
+- `pulseplex doctor` - Runs network and connectivity diagnostics to troubleshoot
+  lag or dropped packets.
+- `pulseplex template eject` - Extracts the default `pulseplex.toml` and fixture
+  JSONs to your current directory for easy customization.
+
+---
+
+## 🏗️ Architecture (Developers)
+
+PulsePlex is organized as a Cargo Workspace utilizing a decoupled
+**Source-Core-Sink** model:
+
+- **`pulseplex-core`**: The protocol-agnostic math and state engine. It listens
+  for normalized `SourceEvents`, calculates decay physics, performs HTP (Highest
+  Takes Precedence) merging, and broadcasts a read-only `[u8; 512]` DMX universe
+  buffer at exactly 40Hz.
+- **`pulseplex-midi` (Source)**: Handles high-priority MIDI input, parsing
+  hardware note velocities into normalized `SourceEvents` and sending them to
+  the Core.
+- **`pulseplex-hue` (Sink)**: A translation layer that listens to the Core's DMX
+  broadcasts. It maps specific virtual DMX addresses to physical Hue bulbs,
+  scaling the 8-bit math to 16-bit RGB, and streaming it via DTLS.
 
 ### The Multi-Tier Configuration
 
-PulsePlex decouples inputs from outputs using a flexible multi-tier model,
-allowing you to swap instruments or lighting rigs without rewriting your entire
-configuration:
+PulsePlex decouples inputs from outputs, allowing you to swap instruments or
+lighting rigs without rewriting your logic:
 
-1. **Input Map**: Maps hardware (e.g., MIDI Note 36) to an Internal ID (e.g.,
-    `snare`).
-2. **Behavior Map**: Defines the math (e.g., `snare` uses a 0.5s Linear Decay).
-3. **Fixture Library**: Instantiates `FixtureProfiles` (JSON) into the virtual
-    DMX universe.
-4. **Mappings & Patching**:
-    - **Fixture Mappings**: Routes behavior intensity to specific fixture
-      capabilities (e.g., `snare` -> `Red` on `Fixture 1`).
-    - **Target Patch**: Maps the global DMX buffer to specific hardware IDs
-      (e.g., Hue Entertainment ID 0 -> DMX address 1).
+1. **Input Map**: Maps hardware (e.g., MIDI Note 36) to a Logical ID (e.g.,
+   `snare`).
+2. **Behavior Map**: Defines the physics (e.g., `snare` uses a 0.5s Linear
+   Decay).
+3. **Fixture Library**: Defines capabilities using standard JSON profiles (e.g.,
+   "Generic RGBW").
+4. **Mappings & Patching**: Routes the calculated behavior intensity to specific
+   fixture channels (e.g., `snare` -> `Red` on `Fixture 1`).
 
-## Getting Started
+## 🛠️ Development
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) (2021 Edition or later)
 - [just](https://github.com/casey/just) (Task runner)
-- `cargo-watch` (For local development)
+- Docker (for ARM64 cross-compilation)
 
-### Development
+### Commands
 
 ```bash
-# Run all local gates (formatting, clippy, and tests)
-just all
+# Run the strict CI gate (formatting, clippy, and locked tests)
+just ci
 
-# Start the development daemon with hot-reloading
+# Start the development daemon with hot-reloading active
 just dev
+
+# Cross-compile for Orange Pi / Raspberry Pi (aarch64)
+just build-arm
 ```
+

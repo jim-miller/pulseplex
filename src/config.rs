@@ -15,6 +15,7 @@ pub struct FixtureDefinition {
     pub id: String,
     pub profile_path: String,
     pub mode: String,
+    pub universe: Option<u16>,
     pub start_address: u16,
 }
 
@@ -122,17 +123,9 @@ pub struct CompiledConfig {
     pub midi_device: String,
     pub midi_id_map: HashMap<u8, usize>,
     pub behaviors: HashMap<usize, BehaviorConfig>,
-    pub dmx_outputs: Vec<DmxOutputCompiled>,
     pub targets: Vec<TargetConfig>,
     pub fixtures: Vec<FixtureInstance>,
     pub fixture_mappings: HashMap<usize, Vec<(usize, pulseplex_core::fixture::CapabilityType)>>,
-}
-
-#[derive(Clone)]
-pub struct DmxOutputCompiled {
-    pub internal_id: usize,
-    pub channel: usize,
-    pub color: Option<[u8; 3]>,
 }
 
 impl PulsePlexConfig {
@@ -172,17 +165,6 @@ impl PulsePlexConfig {
                     midi_note,
                     behavior_id
                 );
-            }
-        }
-
-        let mut dmx_outputs = Vec::new();
-        for d in &self.output.dmx {
-            if let Some(internal_id) = id_to_internal.get(&d.id) {
-                dmx_outputs.push(DmxOutputCompiled {
-                    internal_id: *internal_id,
-                    channel: d.channel,
-                    color: d.color,
-                });
             }
         }
 
@@ -243,6 +225,7 @@ impl PulsePlexConfig {
                 f_def.id.clone(),
                 &profile,
                 &f_def.mode,
+                f_def.universe.unwrap_or(1),
                 f_def.start_address,
             )
             .map_err(|e| anyhow::anyhow!("Failed to instantiate fixture '{}': {}", f_def.id, e))?;
@@ -275,7 +258,6 @@ impl PulsePlexConfig {
             midi_device: self.midi.device_name.clone(),
             midi_id_map,
             behaviors,
-            dmx_outputs,
             targets,
             fixtures,
             fixture_mappings,

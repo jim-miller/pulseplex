@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,7 +13,6 @@ use pulseplex_hue::HueCertVerifier;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::runtime::Builder;
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../assets/default_edrums.toml");
 
@@ -39,19 +39,17 @@ struct HueAuthError {
     description: String,
 }
 
-pub fn run_wizard() -> Result<PathBuf> {
+pub async fn run_wizard() -> Result<PathBuf> {
     println!("Welcome to the PulsePlex Setup Wizard!");
     println!("We'll help you find your Philips Hue Bridge and configure your MIDI device.\n");
 
-    let rt = Builder::new_current_thread().enable_all().build()?;
-
-    let (bridge_ip, bridge_id) = rt.block_on(discover_bridge())?;
+    let (bridge_ip, bridge_id) = discover_bridge().await?;
     println!("Found Hue Bridge: {} ({})", bridge_id, bridge_ip);
 
-    let (username, client_key) = rt.block_on(perform_push_link(&bridge_ip, &bridge_id))?;
+    let (username, client_key) = perform_push_link(&bridge_ip, &bridge_id).await?;
     println!("Successfully linked with Bridge!\n");
 
-    let area_id = rt.block_on(select_entertainment_area(&bridge_ip, &bridge_id, &username))?;
+    let area_id = select_entertainment_area(&bridge_ip, &bridge_id, &username).await?;
 
     let midi_devices = pulseplex_midi::list_midi_devices()?;
     if midi_devices.is_empty() {
@@ -77,8 +75,21 @@ pub fn run_wizard() -> Result<PathBuf> {
 
     let proj_dirs = ProjectDirs::from("", "", "PulsePlex")
         .ok_or_else(|| anyhow!("Could not determine configuration directory"))?;
+
     let config_dir = proj_dirs.config_dir();
     std::fs::create_dir_all(config_dir)?;
+
+    let fixtures_dir = config_dir.join("assets").join("fixtures");
+    std::fs::create_dir_all(&fixtures_dir)?;
+
+    std::fs::write(
+        fixtures_dir.join("hue-color.json"),
+        include_str!("../assets/fixtures/hue-color.json"),
+    )?;
+    std::fs::write(
+        fixtures_dir.join("generic-rgbw.json"),
+        include_str!("../assets/fixtures/generic-rgbw.json"),
+    )?;
 
     let config_path = config_dir.join("pulseplex.toml");
     std::fs::write(&config_path, config_content)?;
@@ -170,6 +181,231 @@ pub fn build_hue_client(bridge_ip: &std::net::IpAddr, bridge_id: &str) -> Result
     builder
         .build()
         .map_err(|e| anyhow!("Failed to build Hue HTTP client: {}", e))
+}
+pub async fn handle_hue_setup(
+    config_path: PathBuf,
+    list: bool,
+    ip_override: Option<String>,
+    force: bool,
+) -> Result<()> {
+    // If just listing, scan and exit
+    if list {
+        println!("Scanning network for Hue Bridges...");
+        let bridges = scan_for_bridges().await?;
+        if bridges.is_empty() {
+            println!("No Hue Bridges found on the local network.");
+        } else {
+            println!("Found {} Bridge(s):", bridges.len());
+            for (ip, id) in bridges {
+                println!("  - IP: {:<15} ID: {}", ip.to_string(), id);
+            }
+        }
+        return Ok(());
+    }
+
+    // Check if config exists and read it
+    let config_str = if config_path.exists() {
+        std::fs::read_to_string(&config_path)?
+    } else {
+        String::new()
+    };
+
+    let mut doc = config_str
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap_or_default();
+
+    // Check if Hue is already configured
+    let has_hue = doc
+        .get("targets")
+        .and_then(|t| t.as_array_of_tables())
+        .map(|arr| arr.iter().any(|table| table.contains_key("hue")))
+        .unwrap_or(false);
+
+    if has_hue && !force {
+        println!("Hue target is already configured in {:?}.", config_path);
+        println!("Use --force to overwrite the existing Hue configuration.");
+        return Ok(());
+    }
+
+    println!("Starting Hue Bridge Setup...");
+
+    let (bridge_ip, bridge_id) = if let Some(manual_ip) = ip_override {
+        if !std::io::stdout().is_terminal() {
+            anyhow::bail!("Cannot prompt for Hue Bridge ID in a non-interactive environment");
+        }
+
+        let ip: IpAddr = manual_ip.parse().context("Invalid IP address provided")?;
+
+        let manual_id: String = Input::with_theme(&ColorfulTheme::default())
+            .with_prompt("Enter the Bridge ID (found on the bottom of the device)")
+            .interact_text()?;
+
+        (ip, manual_id.to_lowercase())
+    } else {
+        discover_bridge().await?
+    };
+
+    println!("Targeting Hue Bridge: {} ({})", bridge_id, bridge_ip);
+
+    let (username, client_key) = perform_push_link(&bridge_ip, &bridge_id).await?;
+    println!("Successfully linked with Bridge!\n");
+
+    let area_id = select_entertainment_area(&bridge_ip, &bridge_id, &username).await?;
+
+    // Inject the new Hue configuration into the TOML document
+    let _ = inject_hue_config(
+        &mut doc,
+        &bridge_ip.to_string(),
+        &bridge_id,
+        &username,
+        &client_key,
+        &area_id,
+    );
+
+    // Save the updated configuration
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&config_path, doc.to_string())?;
+
+    println!(
+        "\n✅ Hue configuration successfully updated in: {:?}",
+        config_path
+    );
+    Ok(())
+}
+
+async fn scan_for_bridges() -> Result<Vec<(IpAddr, String)>> {
+    let mut bridges = Vec::new();
+
+    // mDNS Discovery (Offloaded to tokio's blocking thread pool)
+    let mdns_bridges = tokio::task::spawn_blocking(move || {
+        let mut local_bridges = Vec::new(); // Store results inside the thread
+
+        if let Ok(mdns) = ServiceDaemon::new() {
+            if let Ok(receiver) = mdns.browse("_hue._tcp.local.") {
+                let now = std::time::Instant::now();
+                // This is the blocking loop we want to hide from Tokio
+                while now.elapsed() < Duration::from_secs(3) {
+                    if let Ok(ServiceEvent::ServiceResolved(info)) =
+                        receiver.recv_timeout(Duration::from_millis(250))
+                    {
+                        let addresses = info.get_addresses();
+                        if let Some(ip) = addresses
+                            .iter()
+                            .find(|ip| ip.is_ipv4())
+                            .or_else(|| addresses.iter().next())
+                        {
+                            let bridge_id = match info.get_property_val("bridgeid") {
+                                Some(Some(id_bytes)) => {
+                                    String::from_utf8_lossy(id_bytes).to_lowercase()
+                                }
+                                _ => info
+                                    .get_fullname()
+                                    .split('.')
+                                    .next()
+                                    .unwrap_or("unknown")
+                                    .replace(' ', "-")
+                                    .to_lowercase(),
+                            };
+
+                            // Avoid duplicates
+                            if !local_bridges.iter().any(|(_, id)| id == &bridge_id) {
+                                local_bridges.push((*ip, bridge_id));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        local_bridges // Return the found bridges out of the blocking thread
+    })
+    .await
+    .unwrap_or_default(); // In the rare case the thread panics, return an empty Vec
+
+    // Add whatever the blocking thread found back into our main list
+    bridges.extend(mdns_bridges);
+
+    // 2. N-UPnP Fallback if mDNS finds nothing
+    if bridges.is_empty() {
+        let client = Client::new();
+        // ... (rest of the existing N-UPnP fallback code)
+        if let Ok(resp) = client
+            .get("https://discovery.meethue.com/")
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+        {
+            if let Ok(discovered) = resp.json::<Vec<DiscoveryResponse>>().await {
+                for bridge in discovered {
+                    if let Ok(ip) = bridge.internalipaddress.parse::<IpAddr>() {
+                        let id = bridge.id.to_lowercase();
+                        if !bridges.iter().any(|(_, existing_id)| existing_id == &id) {
+                            bridges.push((ip, id));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(bridges)
+}
+
+fn inject_hue_config(
+    doc: &mut toml_edit::DocumentMut,
+    bridge_ip: &str,
+    bridge_id: &str,
+    username: &str,
+    client_key: &str,
+    area_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use toml_edit::{value, ArrayOfTables, Item, Table};
+
+    // Ensure the targets array exists
+    if !doc.contains_key("targets") {
+        doc["targets"] = Item::ArrayOfTables(ArrayOfTables::new());
+    }
+
+    let targets = doc
+        .get_mut("targets")
+        .and_then(|t| t.as_array_of_tables_mut())
+        .ok_or_else(|| anyhow::anyhow!("'targets' in config is not a valid array of tables"))?;
+
+    // Look for an existing Hue target to overwrite, or create a new one
+    let mut hue_table = None;
+    for table in targets.iter_mut() {
+        if table.contains_key("hue") {
+            hue_table = Some(table);
+            break;
+        }
+    }
+
+    let mut new_hue_inner = Table::new();
+    new_hue_inner.insert("bridge_ip", value(bridge_ip));
+    new_hue_inner.insert("bridge_id", value(bridge_id));
+    new_hue_inner.insert("username", value(username));
+    new_hue_inner.insert("client_key", value(client_key));
+    new_hue_inner.insert("area_id", value(area_id));
+
+    // Default patch to demonstrate the bridge functionality
+    let mut patch_table = Table::new();
+    patch_table.insert("hue_id", value(0));
+    patch_table.insert("dmx_address", value(1));
+
+    let mut patch_array = toml_edit::ArrayOfTables::new();
+    patch_array.push(patch_table);
+    new_hue_inner.insert("patch", Item::ArrayOfTables(patch_array));
+
+    if let Some(existing_table) = hue_table {
+        existing_table["hue"] = Item::Table(new_hue_inner);
+        Ok(())
+    } else {
+        let mut new_target = Table::new();
+        new_target.insert("hue", Item::Table(new_hue_inner));
+        targets.push(new_target);
+        Ok(())
+    }
 }
 
 pub async fn discover_bridge_by_id_fallback(target_id: &str) -> Result<IpAddr> {

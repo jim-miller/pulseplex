@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use std::time::Duration;
 
+pub mod engine;
 pub mod fixture;
 
 use serde::Deserialize;
@@ -38,33 +38,29 @@ pub struct BehaviorConfig {
     pub decay_profile: DecayProfile,
 }
 
-/// Generic signals that can drive the lighting engine.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Signal {
-    /// A trigger event with an internal high-performance ID and velocity.
-    Trigger { id: usize, velocity: u8 },
-    /// A release event
-    Release { id: usize },
-    /// A clock/tick event for synchronization
-    Clock,
+/// Standardized message type for all inputs (MIDI, OSC, Art-Net, etc.)
+#[derive(Debug, Clone, PartialEq)]
+pub enum SourceEvent {
+    /// A hardware trigger (e.g. MIDI Note On)
+    Trigger { id: u16, velocity: u8 },
+    /// An external DMX frame to be merged (e.g. Art-Net Input)
+    DmxFrame { universe: u16, data: Box<[u8; 512]> },
+    /// Clear all active effects/envelopes
+    ClearAll,
 }
 
+// TODO: Refactor sinks to channel-based dispatch to remove Box allocation
 /// Interface for outputting lighting state to hardware or protocols.
-pub trait LightSink: Send {
-    /// Send the current DMX universe state.
-    fn send_universe(&mut self, universe: &[u8; 512]) -> anyhow::Result<()>;
-
-    /// Legacy support for ID-based intensities (optional/deprecated in Fixture architecture).
-    fn send_state(&mut self, _intensities: &HashMap<usize, DecayEnvelope>) -> anyhow::Result<()> {
-        Ok(())
-    }
+#[async_trait::async_trait]
+pub trait LightSink: Send + Sync {
+    /// Send the finalized DMX universe state.
+    async fn write_universe(&mut self, universe_id: u16, data: &[u8; 512]) -> anyhow::Result<()>;
 }
 
-/// Interface for receiving signals from hardware or protocols.
-pub trait EventSource: Send {
-    /// Poll for the next available signals, appending them to the provided buffer.
-    /// This allows the caller to reuse allocations across ticks.
-    fn poll(&mut self, buffer: &mut Vec<Signal>) -> anyhow::Result<()>;
+/// Interface for input hardware to send events to the core.
+pub trait LightSource: Send {
+    /// Start polling for events and send them to the core via the provided sender.
+    fn run(&mut self, sender: crossbeam_channel::Sender<SourceEvent>) -> anyhow::Result<()>;
 }
 
 pub struct DecayEnvelope {
@@ -141,242 +137,37 @@ impl DecayEnvelope {
     }
 }
 
-/// The core stateful lighting engine.
-pub struct PulsePlexEngine {
-    active_lights: HashMap<usize, DecayEnvelope>,
-    behaviors: HashMap<usize, BehaviorConfig>,
-    fixtures: Vec<fixture::FixtureInstance>,
-    /// Maps a behavior ID to a list of (fixture_index, capability_type)
-    capability_mappings: HashMap<usize, Vec<(usize, fixture::CapabilityType)>>,
-    // Pre-allocated buffer for the DMX universe
-    universe_buffer: [u8; 512],
-}
-
-impl PulsePlexEngine {
-    pub fn new(
-        behaviors: HashMap<usize, BehaviorConfig>,
-        fixtures: Vec<fixture::FixtureInstance>,
-        capability_mappings: HashMap<usize, Vec<(usize, fixture::CapabilityType)>>,
-    ) -> Self {
-        Self {
-            active_lights: HashMap::new(),
-            behaviors,
-            fixtures,
-            capability_mappings,
-            universe_buffer: [0u8; 512],
-        }
-    }
-
-    /// Returns the number of currently active lighting envelopes.
-    pub fn active_lights_count(&self) -> usize {
-        self.active_lights.len()
-    }
-
-    /// Returns a reference to the currently active lighting envelopes.
-    pub fn active_lights(&self) -> &HashMap<usize, DecayEnvelope> {
-        &self.active_lights
-    }
-
-    pub fn universe(&self) -> &[u8; 512] {
-        &self.universe_buffer
-    }
-
-    /// Process a single tick of the orchestration loop.
-    /// Polls the source into the provided buffer, updates envelopes, and pushes to sinks.
-    ///
-    /// NOTE: This method will .clear() the provided signal_buffer before processing.
-    pub fn process_tick(
-        &mut self,
-        dt: Duration,
-        source: &mut dyn EventSource,
-        sinks: &mut [&mut dyn LightSink],
-        signal_buffer: &mut Vec<Signal>,
-    ) -> anyhow::Result<()> {
-        signal_buffer.clear();
-        source.poll(signal_buffer)?;
-
-        if !signal_buffer.is_empty() {
-            trace!("Engine polled {} signals", signal_buffer.len());
-        }
-
-        for signal in signal_buffer.iter() {
-            if let Signal::Trigger { id, velocity } = *signal {
-                if let Some(config) = self.behaviors.get(&id) {
-                    trace!(
-                        "Processing trigger for behavior id={}, velocity={}",
-                        id,
-                        velocity
-                    );
-                    let mut env = DecayEnvelope::new(
-                        config.decay_seconds,
-                        config.velocity_curve,
-                        config.decay_profile,
-                    );
-                    env.trigger(velocity);
-                    self.active_lights.insert(id, env);
-                } else {
-                    trace!("No behavior found for id={}", id);
-                }
-            }
-        }
-
-        // Update envelopes
-        self.active_lights.retain(|_, env| {
-            env.tick(dt);
-            !env.is_dead()
-        });
-
-        if !self.active_lights.is_empty() {
-            trace!("Active lights count: {}", self.active_lights.len());
-        }
-
-        // Render HTP Universe
-        self.universe_buffer.fill(0);
-        for (&behavior_id, env) in &self.active_lights {
-            let val = env.dmx_value();
-
-            if let Some(mappings) = self.capability_mappings.get(&behavior_id) {
-                for &(fixture_idx, cap_type) in mappings {
-                    if let Some(fixture) = self.fixtures.get(fixture_idx) {
-                        if let Some(addr) = fixture.get_dmx_address(cap_type) {
-                            if addr < 512 {
-                                self.universe_buffer[addr] =
-                                    std::cmp::max(self.universe_buffer[addr], val);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Push to all sinks
-        for sink in sinks {
-            sink.send_universe(&self.universe_buffer)?;
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-pub struct ArtNetBridge {
-    buffer: [u8; 530],
-}
-
-impl ArtNetBridge {
-    pub fn new(universe: u16) -> Self {
-        let mut buf = [0u8; 530];
-
-        // Fixed Head ID
-        buf[0..8].copy_from_slice(b"Art-Net\0");
-
-        // OpCode (0x5000, little endian)
-        buf[8] = 0x00;
-        buf[9] = 0x50;
-
-        // ProtVer
-        buf[10] = 0x00;
-        buf[11] = 0x0E;
-
-        // Sequence
-        // Physical port
-        buf[13] = 0x00;
-
-        // Universe (little endian)
-        let uni_bytes = universe.to_le_bytes();
-        buf[14] = uni_bytes[0];
-        buf[15] = uni_bytes[1];
-
-        // Length of DMX data (512, big-endian)
-        buf[16] = 0x02;
-        buf[17] = 0x00;
-
-        // Data
-        Self { buffer: buf }
-    }
-
-    pub fn set_channel(&mut self, channel: usize, value: u8) {
-        if channel < 512 {
-            self.buffer[18 + channel] = value;
-        }
-    }
-
-    /// Clear channel data but keep the header
-    pub fn clear_data(&mut self) {
-        for i in 18..530 {
-            self.buffer[i] = 0;
-        }
-    }
-
-    /// Access raw bytes to send over UDP
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.buffer
-    }
-
-    /// Optional but helps receivers
-    pub fn increment_sequence(&mut self) {
-        self.buffer[12] = self.buffer[12].wrapping_add(1);
-    }
-
-    pub fn set_raw_data(&mut self, initial_state: &[u8; 512]) {
-        (0..initial_state.len()).for_each(|i| {
-            self.set_channel(i, initial_state[i]);
-        });
-    }
-
-    /// Extract the 512-byte DMX payload
-    pub fn dmx_data(&self) -> &[u8; 512] {
-        self.buffer[18..530].try_into().unwrap()
-    }
-}
-
 /// A Mock Sink for testing. Records frames sent to it.
 #[derive(Default)]
 pub struct MockSink {
-    pub states: Vec<HashMap<usize, f32>>,
+    pub states: Vec<[u8; 512]>,
 }
 
+#[async_trait::async_trait]
 impl LightSink for MockSink {
-    fn send_universe(&mut self, universe: &[u8; 512]) -> anyhow::Result<()> {
-        // For simplicity in MockSink, we just store the buffer
-        // We convert [u8; 512] to a HashMap of "channel -> value" to keep states flexible
-        let mut state = HashMap::new();
-        for (i, &val) in universe.iter().enumerate() {
-            if val > 0 {
-                state.insert(i, val as f32);
-            }
-        }
-        self.states.push(state);
-        Ok(())
-    }
-
-    fn send_state(&mut self, intensities: &HashMap<usize, DecayEnvelope>) -> anyhow::Result<()> {
-        let mut state = HashMap::new();
-        for (&id, env) in intensities {
-            state.insert(id, env.intensity);
-        }
-        self.states.push(state);
+    async fn write_universe(&mut self, _universe_id: u16, data: &[u8; 512]) -> anyhow::Result<()> {
+        self.states.push(*data);
         Ok(())
     }
 }
 
 /// A Mock Source for testing.
 pub struct MockSource {
-    queue: Vec<Vec<Signal>>,
+    events: Vec<SourceEvent>,
 }
 
 impl MockSource {
-    pub fn new(timeline: Vec<Vec<Signal>>) -> Self {
-        let mut queue = timeline;
-        queue.reverse(); // Reverse so we can pop
-        Self { queue }
+    pub fn new(events: Vec<SourceEvent>) -> Self {
+        let mut events = events;
+        events.reverse(); // Reverse so we can pop
+        Self { events }
     }
 }
 
-impl EventSource for MockSource {
-    fn poll(&mut self, buffer: &mut Vec<Signal>) -> anyhow::Result<()> {
-        if let Some(mut signals) = self.queue.pop() {
-            buffer.append(&mut signals);
+impl LightSource for MockSource {
+    fn run(&mut self, sender: crossbeam_channel::Sender<SourceEvent>) -> anyhow::Result<()> {
+        while let Some(event) = self.events.pop() {
+            sender.send(event)?;
         }
         Ok(())
     }
@@ -385,7 +176,42 @@ impl EventSource for MockSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::PulsePlexEngine;
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::Duration;
+
+    // Helper to allow downcasting MockSink in tests
+    impl MockSink {
+        pub fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct SharedMockSink {
+        inner: Arc<tokio::sync::Mutex<MockSink>>,
+    }
+
+    impl SharedMockSink {
+        fn new(inner: Arc<tokio::sync::Mutex<MockSink>>) -> Self {
+            Self { inner }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LightSink for SharedMockSink {
+        async fn write_universe(
+            &mut self,
+            universe_id: u16,
+            data: &[u8; 512],
+        ) -> anyhow::Result<()> {
+            self.inner
+                .lock()
+                .await
+                .write_universe(universe_id, data)
+                .await
+        }
+    }
 
     #[test]
     fn test_time_aware_decay() {
@@ -434,8 +260,8 @@ mod tests {
         assert!((env_exp.intensity - 0.082).abs() < 0.01);
     }
 
-    #[test]
-    fn test_htp_merging() {
+    #[tokio::test]
+    async fn test_htp_merging() {
         let mut behaviors = HashMap::new();
         behaviors.insert(
             1,
@@ -454,7 +280,7 @@ mod tests {
             },
         );
 
-        // Setup a fixture: 1 channel, Red capability at offset 0, start address 1.
+        // Setup a fixture: 1 channel, Red capability at offset 0, start address 1, universe 1.
         let mut available_channels = HashMap::new();
         available_channels.insert(
             "Red".to_string(),
@@ -476,7 +302,8 @@ mod tests {
             }],
         };
         let fixture =
-            fixture::FixtureInstance::from_ofl("f1".to_string(), &profile, "3-channel", 1).unwrap();
+            fixture::FixtureInstance::from_ofl("f1".to_string(), &profile, "3-channel", 1, 1)
+                .unwrap();
 
         let mut capability_mappings = HashMap::new();
         // behavior 1 -> fixture 0, Red
@@ -485,120 +312,35 @@ mod tests {
         capability_mappings.insert(2, vec![(0, fixture::CapabilityType::Red)]);
 
         let mut engine = PulsePlexEngine::new(behaviors, vec![fixture], capability_mappings);
-        let mut sink = MockSink::default();
-        let mut signal_buffer = Vec::new();
+        let mock_sink_inner = Arc::new(tokio::sync::Mutex::new(MockSink::default()));
+        let mut sinks: Vec<Box<dyn LightSink>> =
+            vec![Box::new(SharedMockSink::new(mock_sink_inner.clone()))];
 
-        let timeline = vec![vec![
-            Signal::Trigger {
-                id: 1,
-                velocity: 64,
-            }, // ~0.5 -> ~127 DMX
-            Signal::Trigger {
-                id: 2,
-                velocity: 100,
-            }, // ~0.787 -> ~200 DMX
-        ]];
-        let mut source = MockSource::new(timeline);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(SourceEvent::Trigger {
+            id: 1,
+            velocity: 64,
+        })
+        .unwrap();
+        tx.send(SourceEvent::Trigger {
+            id: 2,
+            velocity: 100,
+        })
+        .unwrap();
 
         engine
-            .process_tick(
-                Duration::from_millis(0),
-                &mut source,
-                &mut [&mut sink],
-                &mut signal_buffer,
-            )
+            .tick(Duration::from_millis(0), &rx, &mut sinks)
+            .await
             .unwrap();
 
         // The Red channel (index 0) should be the max of the two triggers.
-        let val = sink.states[0]
-            .get(&0)
-            .expect("Red channel should have a value");
+        let mock_sink = mock_sink_inner.lock().await;
+        let val = mock_sink.states[0][0];
+        // 100 / 127 * 255 ≈ 200.7
         assert!(
-            *val > 190.0 && *val < 210.0,
+            val > 190 && val < 210,
             "HTP merging failed: expected ~200, got {}",
             val
         );
-    }
-
-    #[test]
-    fn test_mock_signals() {
-        let timeline = vec![vec![Signal::Release { id: 42 }, Signal::Clock]];
-
-        let mut source = MockSource::new(timeline);
-        let mut buffer = Vec::new();
-
-        source.poll(&mut buffer).unwrap();
-        assert_eq!(buffer.len(), 2);
-        assert_eq!(buffer[0], Signal::Release { id: 42 });
-        assert_eq!(buffer[1], Signal::Clock);
-
-        buffer.clear();
-        source.poll(&mut buffer).unwrap();
-        assert!(buffer.is_empty());
-    }
-
-    #[test]
-    fn test_engine_broadcast() {
-        let mut behaviors = HashMap::new();
-        behaviors.insert(
-            36,
-            BehaviorConfig {
-                decay_seconds: 0.1,
-                velocity_curve: VelocityCurve::Linear,
-                decay_profile: DecayProfile::Linear,
-            },
-        );
-
-        let mut available_channels = HashMap::new();
-        available_channels.insert(
-            "Intensity".to_string(),
-            fixture::OflChannel {
-                capabilities: vec![fixture::OflCapability {
-                    cap_type: "Intensity".to_string(),
-                    dmx_range: [0, 255],
-                    color: None,
-                }],
-            },
-        );
-
-        let profile = fixture::OflFixture {
-            name: "TestFixture".to_string(),
-            available_channels,
-            modes: vec![fixture::OflMode {
-                name: "3-channel".to_string(),
-                channels: vec!["Intensity".to_string()],
-            }],
-        };
-        let fixture =
-            fixture::FixtureInstance::from_ofl("f1".to_string(), &profile, "3-channel", 1).unwrap();
-
-        let mut capability_mappings = HashMap::new();
-        capability_mappings.insert(36, vec![(0, fixture::CapabilityType::Intensity)]);
-
-        let mut engine = PulsePlexEngine::new(behaviors, vec![fixture], capability_mappings);
-        let timeline = vec![vec![Signal::Trigger {
-            id: 36,
-            velocity: 127,
-        }]];
-        let mut source = MockSource::new(timeline);
-        let mut signal_buffer = Vec::new();
-
-        let mut sink1 = MockSink::default();
-        let mut sink2 = MockSink::default();
-
-        engine
-            .process_tick(
-                Duration::from_millis(25),
-                &mut source,
-                &mut [&mut sink1, &mut sink2],
-                &mut signal_buffer,
-            )
-            .unwrap();
-
-        assert_eq!(sink1.states.len(), 1);
-        assert_eq!(sink2.states.len(), 1);
-        // Intensity is at start_address 1, which is index 0
-        assert_eq!(sink1.states[0].get(&0), sink2.states[0].get(&0));
-        assert!(*sink1.states[0].get(&0).unwrap() > 0.0);
     }
 }
