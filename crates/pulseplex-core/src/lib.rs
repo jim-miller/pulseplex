@@ -49,6 +49,7 @@ pub enum SourceEvent {
     ClearAll,
 }
 
+// TODO: Refactor sinks to channel-based dispatch to remove Box allocation
 /// Interface for outputting lighting state to hardware or protocols.
 #[async_trait::async_trait]
 pub trait LightSink: Send + Sync {
@@ -179,6 +180,13 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
+
+    // Helper to allow downcasting MockSink in tests
+    impl MockSink {
+        pub fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
 
     struct SharedMockSink {
         inner: Arc<tokio::sync::Mutex<MockSink>>,
@@ -334,12 +342,5 @@ mod tests {
             "HTP merging failed: expected ~200, got {}",
             val
         );
-    }
-}
-
-// Helper to allow downcasting MockSink in tests
-impl MockSink {
-    pub fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }

@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -229,6 +230,10 @@ pub async fn handle_hue_setup(
     println!("Starting Hue Bridge Setup...");
 
     let (bridge_ip, bridge_id) = if let Some(manual_ip) = ip_override {
+        if !std::io::stdout().is_terminal() {
+            anyhow::bail!("Cannot prompt for Hue Bridge ID in a non-interactive environment");
+        }
+
         let ip: IpAddr = manual_ip.parse().context("Invalid IP address provided")?;
 
         let manual_id: String = Input::with_theme(&ColorfulTheme::default())
@@ -248,7 +253,7 @@ pub async fn handle_hue_setup(
     let area_id = select_entertainment_area(&bridge_ip, &bridge_id, &username).await?;
 
     // Inject the new Hue configuration into the TOML document
-    inject_hue_config(
+    let _ = inject_hue_config(
         &mut doc,
         &bridge_ip.to_string(),
         &bridge_id,
@@ -273,46 +278,58 @@ pub async fn handle_hue_setup(
 async fn scan_for_bridges() -> Result<Vec<(IpAddr, String)>> {
     let mut bridges = Vec::new();
 
-    // mDNS Discovery
-    if let Ok(mdns) = ServiceDaemon::new() {
-        if let Ok(receiver) = mdns.browse("_hue._tcp.local.") {
-            let now = std::time::Instant::now();
-            while now.elapsed() < Duration::from_secs(3) {
-                if let Ok(ServiceEvent::ServiceResolved(info)) =
-                    receiver.recv_timeout(Duration::from_millis(250))
-                {
-                    let addresses = info.get_addresses();
-                    if let Some(ip) = addresses
-                        .iter()
-                        .find(|ip| ip.is_ipv4())
-                        .or_else(|| addresses.iter().next())
-                    {
-                        let bridge_id = match info.get_property_val("bridgeid") {
-                            Some(Some(id_bytes)) => {
-                                String::from_utf8_lossy(id_bytes).to_lowercase()
-                            }
-                            _ => info
-                                .get_fullname()
-                                .split('.')
-                                .next()
-                                .unwrap_or("unknown")
-                                .replace(' ', "-")
-                                .to_lowercase(),
-                        };
+    // mDNS Discovery (Offloaded to tokio's blocking thread pool)
+    let mdns_bridges = tokio::task::spawn_blocking(move || {
+        let mut local_bridges = Vec::new(); // Store results inside the thread
 
-                        // Avoid duplicates
-                        if !bridges.iter().any(|(_, id)| id == &bridge_id) {
-                            bridges.push((*ip, bridge_id));
+        if let Ok(mdns) = ServiceDaemon::new() {
+            if let Ok(receiver) = mdns.browse("_hue._tcp.local.") {
+                let now = std::time::Instant::now();
+                // This is the blocking loop we want to hide from Tokio
+                while now.elapsed() < Duration::from_secs(3) {
+                    if let Ok(ServiceEvent::ServiceResolved(info)) =
+                        receiver.recv_timeout(Duration::from_millis(250))
+                    {
+                        let addresses = info.get_addresses();
+                        if let Some(ip) = addresses
+                            .iter()
+                            .find(|ip| ip.is_ipv4())
+                            .or_else(|| addresses.iter().next())
+                        {
+                            let bridge_id = match info.get_property_val("bridgeid") {
+                                Some(Some(id_bytes)) => {
+                                    String::from_utf8_lossy(id_bytes).to_lowercase()
+                                }
+                                _ => info
+                                    .get_fullname()
+                                    .split('.')
+                                    .next()
+                                    .unwrap_or("unknown")
+                                    .replace(' ', "-")
+                                    .to_lowercase(),
+                            };
+
+                            // Avoid duplicates
+                            if !local_bridges.iter().any(|(_, id)| id == &bridge_id) {
+                                local_bridges.push((*ip, bridge_id));
+                            }
                         }
                     }
                 }
             }
         }
-    }
+        local_bridges // Return the found bridges out of the blocking thread
+    })
+    .await
+    .unwrap_or_default(); // In the rare case the thread panics, return an empty Vec
 
-    // N-UPnP Fallback if mDNS finds nothing
+    // Add whatever the blocking thread found back into our main list
+    bridges.extend(mdns_bridges);
+
+    // 2. N-UPnP Fallback if mDNS finds nothing
     if bridges.is_empty() {
         let client = Client::new();
+        // ... (rest of the existing N-UPnP fallback code)
         if let Ok(resp) = client
             .get("https://discovery.meethue.com/")
             .timeout(Duration::from_secs(3))
@@ -342,7 +359,7 @@ fn inject_hue_config(
     username: &str,
     client_key: &str,
     area_id: &str,
-) {
+) -> Result<(), Box<dyn std::error::Error>> {
     use toml_edit::{value, ArrayOfTables, Item, Table};
 
     // Ensure the targets array exists
@@ -350,7 +367,10 @@ fn inject_hue_config(
         doc["targets"] = Item::ArrayOfTables(ArrayOfTables::new());
     }
 
-    let targets = doc["targets"].as_array_of_tables_mut().unwrap();
+    let targets = doc
+        .get_mut("targets")
+        .and_then(|t| t.as_array_of_tables_mut())
+        .ok_or_else(|| anyhow::anyhow!("'targets' in config is not a valid array of tables"))?;
 
     // Look for an existing Hue target to overwrite, or create a new one
     let mut hue_table = None;
@@ -379,10 +399,12 @@ fn inject_hue_config(
 
     if let Some(existing_table) = hue_table {
         existing_table["hue"] = Item::Table(new_hue_inner);
+        Ok(())
     } else {
         let mut new_target = Table::new();
         new_target.insert("hue", Item::Table(new_hue_inner));
         targets.push(new_target);
+        Ok(())
     }
 }
 

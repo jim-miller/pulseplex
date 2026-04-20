@@ -207,15 +207,20 @@ impl ArtNetBridge {
 
 /// A wrapper that implements LightSink for Art-Net UDP output.
 pub struct ArtNetSink {
-    socket: UdpSocket,
+    socket: tokio::net::UdpSocket,
     addr: SocketAddr,
     bridge: ArtNetBridge,
 }
 
 impl ArtNetSink {
     pub fn new(universe: u16, target_ip: &str) -> anyhow::Result<Self> {
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
-        socket.set_broadcast(true)?;
+        let std_socket = UdpSocket::bind("0.0.0.0:0")?;
+        std_socket.set_broadcast(true)?;
+        std_socket.set_nonblocking(true)?;
+
+        // this needs to not block the tokio worker thread
+        let socket = tokio::net::UdpSocket::from_std(std_socket)?;
+
         let addr = target_ip
             .to_socket_addrs()?
             .next()
@@ -233,7 +238,9 @@ impl ArtNetSink {
 impl LightSink for ArtNetSink {
     async fn write_universe(&mut self, _universe_id: u16, data: &[u8; 512]) -> anyhow::Result<()> {
         self.bridge.set_raw_data(data);
-        self.socket.send_to(self.bridge.as_bytes(), self.addr)?;
+        self.socket
+            .send_to(self.bridge.as_bytes(), self.addr)
+            .await?;
         self.bridge.increment_sequence();
         Ok(())
     }
@@ -356,12 +363,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Version Check in Background
-    std::thread::spawn(|| {
-        if let Err(e) = check_for_updates() {
-            debug!("Update check failed: {}", e);
-        }
-    });
-
     std::thread::spawn(|| {
         if let Err(e) = check_for_updates() {
             debug!("Update check failed: {}", e);
@@ -651,6 +652,12 @@ async fn run_daemon(config_path: PathBuf, force_select: bool, use_tui: bool) -> 
         }
     }
 
+    if sinks.is_empty() {
+        anyhow::bail!(
+            "No valid lighting targets configured. Run 'pulseplex hue setup' or edit the config"
+        )
+    }
+
     let sleeper = SpinSleeper::default();
 
     let mut initial_state = [0u8; 512];
@@ -799,7 +806,7 @@ fn ui(f: &mut Frame, state: &DashboardState) {
     // DMX Visualization
     let dmx_block = Block::default()
         .borders(Borders::ALL)
-        .title(" DMX Output (Universe 0) ");
+        .title(" DMX Output (Universe 1) ");
 
     // Calculate available columns dynamically (subtracting 2 for borders).
     // Each cell is 2 chars wide ("██")
@@ -817,14 +824,13 @@ fn ui(f: &mut Frame, state: &DashboardState) {
         };
         current_row.push(Span::styled("██", Style::default().fg(color)));
 
-        // Wrap to the next line if we run out of terminal width
         if current_row.len() == cols {
-            dmx_lines.push(Line::from(current_row.clone()));
-            current_row.clear();
+            // zero allocation swap
+            dmx_lines.push(Line::from(std::mem::take(&mut current_row)));
         }
     }
     if !current_row.is_empty() {
-        dmx_lines.push(Line::from(current_row));
+        dmx_lines.push(Line::from(std::mem::take(&mut current_row)));
     }
 
     let dmx_para = Paragraph::new(dmx_lines).block(dmx_block);
@@ -1073,8 +1079,8 @@ mod tests {
         assert_eq!(last.lock().await.states.len(), 1);
     }
 
-    #[test]
-    fn test_artnet_sink_creation() {
+    #[tokio::test]
+    async fn test_artnet_sink_creation() {
         let sink = ArtNetSink::new(1, "127.0.0.1:6454");
         assert!(sink.is_ok());
 

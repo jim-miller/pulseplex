@@ -4,8 +4,11 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 pub struct PulsePlexEngine {
-    /// Internal DMX state (currently only support one universe in this refactor stage)
+    /// Final DMX output state for the primary universe
     universe_buffer: [u8; 512],
+    /// Last received external DMX state for the primary universe, kept separate
+    /// so it can be HTP-merged into the generated frame during the tick
+    external_dmx: Option<Box<[u8; 512]>>,
     active_envelopes: HashMap<u16, DecayEnvelope>,
     behaviors: HashMap<u16, BehaviorConfig>,
     fixtures: Vec<fixture::FixtureInstance>,
@@ -21,6 +24,7 @@ impl PulsePlexEngine {
     ) -> Self {
         Self {
             universe_buffer: [0u8; 512],
+            external_dmx: None,
             active_envelopes: HashMap::new(),
             behaviors,
             fixtures,
@@ -51,17 +55,17 @@ impl PulsePlexEngine {
                 }
                 SourceEvent::DmxFrame { universe, data } => {
                     // For now, we only support universe 1 in the primary merge
-                    // In a future multi-universe refactor, this would be handled differently.
+                    // Store external DMX separately so it can be HTP-merged into
+                    // the generated frame later without being lost when
+                    // `self.universe_buffer` is refreshed from `current_time`
                     if universe == 1 {
-                        for i in 0..512 {
-                            self.universe_buffer[i] =
-                                std::cmp::max(self.universe_buffer[i], data[i]);
-                        }
+                        self.external_dmx = Some(data);
                     }
                 }
                 SourceEvent::ClearAll => {
                     self.active_envelopes.clear();
                     self.universe_buffer.fill(0);
+                    self.external_dmx = None;
                 }
             }
         }
@@ -99,9 +103,16 @@ impl PulsePlexEngine {
             }
         }
 
+        // Apply HTP Merge for external DMX
+        if let Some(ext_frame) = &self.external_dmx {
+            for i in 0..512 {
+                current_frame[i] = current_frame[i].max(ext_frame[i]);
+            }
+        }
+
         self.universe_buffer = current_frame;
 
-        // 4. Broadcast
+        // Broadcast to Sinks
         for sink in sinks.iter_mut() {
             // Plan says: sink.write_universe(1, &current_universe).await
             if let Err(e) = sink.write_universe(1, &self.universe_buffer).await {
