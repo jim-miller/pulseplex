@@ -42,7 +42,7 @@ jobs:
           sudo apt-get install -y pkg-config libasound2-dev libjack-jackd2-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # v1.94.1
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # v1.94.1
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
